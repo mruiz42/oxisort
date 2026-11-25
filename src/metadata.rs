@@ -195,6 +195,19 @@ mod tests {
     }
 
     #[test]
+    fn container_formats() {
+        for name in ["a.heic", "a.png", "a.tiff", "fake.arw", "a.webp"] {
+            let m = read_fixture(name, None);
+            assert!(m.exif[0].is_some(), "{name}: {:?}", m.warnings);
+        }
+        let mkv = read_fixture("a.mkv", None).media_create.unwrap();
+        assert_eq!(mkv.to_rfc3339(), "2020-05-06T07:08:09+00:00");
+        // mvhd = 0 is reported by nom-exif as 1904; date::resolve drops it.
+        let zero = read_fixture("nodate.mp4", None).media_create;
+        assert!(zero.is_none_or(|d| d.timestamp() < 0), "{zero:?}");
+    }
+
+    #[test]
     fn kamadak_fallback_reads_jpeg() {
         let exif = read_kamadak(&fixture("dto.jpg")).unwrap();
         assert_eq!(exif[0].as_ref().unwrap().subsec.as_deref(), Some("123"));
