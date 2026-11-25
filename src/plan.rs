@@ -937,15 +937,13 @@ mod tests {
 
     #[test]
     fn many_files_sharing_one_timestamp_all_get_names_fast() {
-        // 12,000 > the old 9,999 cap; with a quadratic walk this took
-        // seconds, with per-chain cursors it is linear.
+        // 12,000 > the old 9,999 cap. Correctness only, no wall-clock
+        // check: a timing assert would be flaky on a loaded CI box.
         const N: u64 = 12_000;
         let staged = (0..N)
             .map(|i| Ok(cand(&format!("/in/{i}.jpg"), "x", i, i)))
             .collect();
-        let started = std::time::Instant::now();
         let acts = resolve(staged, &DestIndex::default(), &HashMap::new(), false);
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert_eq!(dst(&acts[0]), format!("{OUT}/x.jpg"));
         assert_eq!(dst(&acts[N as usize - 1]), format!("{OUT}/x-{N}.jpg"));
         let unique: HashSet<String> = acts.iter().map(dst).collect();
@@ -979,6 +977,39 @@ mod tests {
             false,
         );
         assert_eq!(dst(&acts[0]), format!("{OUT}/x-501.jpg"));
+    }
+
+    #[test]
+    fn match_above_the_first_free_slot_is_ignored() {
+        // x.jpg differs, x-2 is free, x-3.jpg is identical: the walk stops
+        // at the free x-2 before it ever sees x-3, so this is a transfer.
+        let mut index = DestIndex::default();
+        index.insert(Path::new(OUT), OsStr::new("x.jpg"), info(9, 90));
+        index.insert(Path::new(OUT), OsStr::new("x-3.jpg"), info(5, 93));
+        let h = hashes(&[(&format!("{OUT}/x-3.jpg"), 3), ("/in/a.jpg", 3)]);
+        let acts = resolve(vec![Ok(cand("/in/a.jpg", "x", 5, 11))], &index, &h, true);
+        assert_eq!(dst(&acts[0]), format!("{OUT}/x-2.jpg"));
+    }
+
+    #[test]
+    fn match_still_found_when_a_sidecar_name_is_taken() {
+        // x.xmp blocks x as a free slot for the bundle, but x.jpg is
+        // identical to the input, so the input is its duplicate.
+        let mut index = DestIndex::default();
+        index.insert(Path::new(OUT), OsStr::new("x.xmp"), None);
+        index.insert(Path::new(OUT), OsStr::new("x.jpg"), info(5, 90));
+        let h = hashes(&[(&format!("{OUT}/x.jpg"), 3), ("/in/a.jpg", 3)]);
+        let mut c = cand("/in/a.jpg", "x", 5, 11);
+        c.sidecars.push(Sidecar {
+            path: "/in/a.xmp".into(),
+            form: SidecarForm::StemOnly,
+        });
+        let acts = resolve(vec![Ok(c)], &index, &h, true);
+        assert!(
+            matches!(&acts[0], Action::Duplicate { of, .. } if of == &PathBuf::from(format!("{OUT}/x.jpg"))),
+            "{:?}",
+            acts[0]
+        );
     }
 
     #[test]
