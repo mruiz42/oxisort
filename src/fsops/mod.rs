@@ -88,7 +88,24 @@ fn appeared_or<'a>(op: &'static str, dst: &'a Path) -> impl FnOnce(io::Error) ->
 /// # Errors
 /// [`FsError::DestinationAppeared`] if `dst` exists; [`FsError::Io`] otherwise.
 pub fn copy_file(src: &Path, dst: &Path) -> Result<CopyHow, FsError> {
-    copy_exclusive(src, dst, true).map(|(how, _)| how)
+    let (how, file) = copy_exclusive(src, dst, true)?;
+    if let Some(file) = file {
+        close_or_remove(file, dst)?;
+    }
+    Ok(how)
+}
+
+/// Closes a destination we wrote, so a delayed write error (network
+/// filesystems report some only at `close`) fails the copy instead of being
+/// dropped silently. On error the partial destination is removed.
+fn close_or_remove(file: File, dst: &Path) -> Result<(), FsError> {
+    sys::close_checked(file).map_err(|source| {
+        remove_partial(dst);
+        FsError::Io {
+            op: "close",
+            source,
+        }
+    })
 }
 
 /// The copy engine. Returns the open destination when it did a data copy,
@@ -219,7 +236,7 @@ fn move_across_devices(
             source: e,
         });
     }
-    drop(file);
+    close_or_remove(file, dst)?;
     sync_parent(dst);
     after_copy(dst);
     let got = fs::metadata(dst).map(|m| m.len()).unwrap_or(u64::MAX);

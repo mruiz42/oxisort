@@ -24,6 +24,22 @@ fn check(ret: libc::c_int) -> io::Result<()> {
     }
 }
 
+/// Closes `file` and reports the result, which dropping a `File` ignores.
+/// NFS and SMB can report delayed write errors only at `close`.
+///
+/// `EINTR` counts as success: on macOS and Linux the descriptor is released
+/// anyway, and retrying could close a descriptor another thread just got.
+pub fn close_checked(file: File) -> io::Result<()> {
+    use std::os::fd::IntoRawFd;
+    let fd = file.into_raw_fd();
+    // SAFETY: `fd` came from `into_raw_fd`, so we own it and nothing else
+    // closes it; it is not used after this call.
+    match check(unsafe { libc::close(fd) }) {
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(()),
+        r => r,
+    }
+}
+
 /// Clones `src` (an open file) to the new path `dst` (APFS copy-on-write).
 /// Fails with `EEXIST` if `dst` exists, and `ENOTSUP`/`EXDEV` where cloning
 /// isn't possible.
