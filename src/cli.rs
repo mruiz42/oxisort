@@ -92,7 +92,8 @@ pub struct Args {
 
     /// Zone for UTC-only dates (video mvhd/MKV, mtime): UTC, Z, ±HH:MM or
     /// ±HHMM. Default: the system zone. Camera EXIF times are never shifted.
-    #[arg(long, value_name = "ZONE")]
+    // Negative offsets start with '-', so let clap take them as values.
+    #[arg(long, value_name = "ZONE", allow_hyphen_values = true)]
     pub tz: Option<String>,
 
     /// Only process images or only videos (other files are skipped).
@@ -452,6 +453,14 @@ mod tests {
         assert!(args(&["--io-jobs", "1", "-j", "512"]).is_ok());
         assert!(args(&["--max-depth", "70000"]).is_err());
         assert_eq!(args(&[]).unwrap().io_jobs, 4);
+    }
+
+    #[test]
+    fn negative_tz_is_a_value() {
+        assert_eq!(
+            args(&["--tz", "-08:00"]).unwrap().tz.as_deref(),
+            Some("-08:00")
+        );
     }
 
     #[test]
