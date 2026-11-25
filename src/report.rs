@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
+use crate::exec::Stop;
 use crate::model::{Action, Kind, Mode, NotRun, Outcome, SkipReason};
 use crate::scan::ScanCounts;
 
@@ -107,8 +108,12 @@ impl RunSummary {
             0.0
         };
         let verb = if self.dry_run { "dry run" } else { mode.verb() };
-        // An interrupted run did not finish, so the header must not say it did.
-        let ended = if self.interrupted {
+        // A stopped run did not finish, so the header must not say it did.
+        // A full destination wins over Ctrl-C: it is the reason the user
+        // has to act on (free space), and it may have triggered the stop.
+        let ended = if self.disk_full {
+            "stopped: destination full after"
+        } else if self.interrupted {
             "interrupted after"
         } else {
             "finished in"
@@ -180,6 +185,20 @@ impl RunSummary {
             let _ = writeln!(s, "  (dry run, nothing changed)");
         }
         s.trim_end().to_owned()
+    }
+}
+
+/// Folds the run's final stop state into the summary.
+///
+/// A stop that hit after the last task started (an `ENOSPC` on the final
+/// transfer, a Ctrl-C during `--rmdirs`) leaves no `NotRun` outcome behind,
+/// but the run was still cut short, so the header and exit code must say
+/// so. `Stop::reason` also picks up SIGINT.
+pub fn apply_stop(summary: &mut RunSummary, stop: &Stop) {
+    match stop.reason() {
+        Some(NotRun::Interrupted) => summary.interrupted = true,
+        Some(NotRun::DiskFull) => summary.disk_full = true,
+        Some(NotRun::DependencyFailed) | None => {}
     }
 }
 
@@ -257,5 +276,59 @@ mod tests {
         assert!(text.contains("dry run finished"));
         assert!(text.contains("(dry run, nothing changed)"));
         assert!(text.contains("… and 5 more"));
+    }
+
+    fn header(s: &RunSummary, mode: Mode) -> String {
+        let text = s.render(mode, Duration::from_millis(2020), 4);
+        text.lines().next().unwrap().to_owned()
+    }
+
+    #[test]
+    fn disk_full_header() {
+        let mut s = RunSummary::default();
+        assert_eq!(
+            header(&s, Mode::Copy),
+            "oxisort: copy finished in 2.02 s (4 files, 2 files/s)"
+        );
+        s.interrupted = true;
+        assert_eq!(
+            header(&s, Mode::Move),
+            "oxisort: move interrupted after 2.02 s (4 files, 2 files/s)"
+        );
+        s.disk_full = true;
+        assert_eq!(
+            header(&s, Mode::Copy),
+            "oxisort: copy stopped: destination full after 2.02 s (4 files, 2 files/s)",
+            "disk full takes precedence over interrupted"
+        );
+        let dry = RunSummary {
+            dry_run: true,
+            ..RunSummary::default()
+        };
+        assert!(header(&dry, Mode::Copy).starts_with("oxisort: dry run finished in "));
+    }
+
+    #[test]
+    fn apply_stop_sets_disk_full_without_not_run() {
+        let mut s = RunSummary::default();
+        apply_stop(&mut s, &Stop::new());
+        assert!(!s.disk_full && !s.interrupted);
+
+        let stop = Stop::new();
+        stop.request(NotRun::DiskFull);
+        apply_stop(&mut s, &stop);
+        assert!(s.disk_full && !s.interrupted);
+        assert_eq!(s.not_run, 0);
+        assert_eq!(s.exit_code(), 1);
+        assert!(
+            header(&s, Mode::Copy).starts_with("oxisort: copy stopped: destination full after")
+        );
+
+        let mut i = RunSummary::default();
+        let stop = Stop::new();
+        stop.request(NotRun::Interrupted);
+        apply_stop(&mut i, &stop);
+        assert!(i.interrupted && !i.disk_full);
+        assert_eq!(i.exit_code(), 130);
     }
 }

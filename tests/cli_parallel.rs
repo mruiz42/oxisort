@@ -225,10 +225,14 @@ fn disk_full_stop_reports_not_run_and_exit_1() {
     assert_eq!(outcomes, [Outcome::NotRun(NotRun::DiskFull)]);
     let summary = oxisort::summarize(&cfg, &scanned, &plan, &outcomes);
     assert_eq!(summary.exit_code(), 1);
+    let text = summary.render(cfg.mode, Default::default(), 1);
     assert!(
-        summary
-            .render(cfg.mode, Default::default(), 1)
-            .contains("destination full")
+        text.starts_with("oxisort: copy stopped: destination full after"),
+        "{text}"
+    );
+    assert!(
+        text.contains("not run:          1 (destination full)"),
+        "{text}"
     );
 }
 

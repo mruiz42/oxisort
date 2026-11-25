@@ -173,11 +173,8 @@ pub fn run(cfg: &Config, stop: &Stop, progress: &Progress) -> Result<RunSummary,
     summary.dirs_removed = rm.dirs;
     summary.junk_removed = rm.junk;
     summary.errors.extend(rm.errors);
-    // A Ctrl-C after the last task started (or during --rmdirs, which then
-    // keeps the remaining folders) leaves no NotRun outcome behind, but the
-    // run was still cut short: exit 130, not 0.
-    // `Stop::reason` also picks up SIGINT.
-    summary.interrupted |= stop.reason() == Some(model::NotRun::Interrupted);
+    // A stop after the last task started leaves no NotRun outcome behind.
+    report::apply_stop(&mut summary, stop);
     log::info!(
         target: SUMMARY,
         "{}",
