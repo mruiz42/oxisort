@@ -107,10 +107,16 @@ impl RunSummary {
             0.0
         };
         let verb = if self.dry_run { "dry run" } else { mode.verb() };
+        // An interrupted run did not finish, so the header must not say it did.
+        let ended = if self.interrupted {
+            "interrupted after"
+        } else {
+            "finished in"
+        };
         let mut s = String::new();
         let _ = writeln!(
             s,
-            "oxisort: {verb} finished in {secs:.2} s ({files_seen} files, {rate:.0} files/s)"
+            "oxisort: {verb} {ended} {secs:.2} s ({files_seen} files, {rate:.0} files/s)"
         );
         let _ = writeln!(
             s,

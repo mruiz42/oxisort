@@ -159,6 +159,26 @@ pub fn not_run(plan: &Plan, why: NotRun) -> Vec<Outcome> {
         .collect()
 }
 
+/// State of the transfer a duplicate depends on, once wave 1 is over.
+#[derive(Debug, Clone, Copy)]
+enum Dependency {
+    /// It made the copy (or the duplicate has no planned dependency).
+    Done,
+    /// The run stopped before it started.
+    Stopped(NotRun),
+    /// It ran and failed.
+    Failed,
+}
+
+/// The words used for a not-run reason in log lines (as in the summary).
+fn stop_label(why: NotRun) -> &'static str {
+    match why {
+        NotRun::Interrupted => "interrupted",
+        NotRun::DiskFull => "destination full",
+        NotRun::DependencyFailed => "a file they depend on failed",
+    }
+}
+
 /// Shared state for one execution.
 struct Exec<'a> {
     mode: Mode,
@@ -227,16 +247,24 @@ pub fn execute(
     ex.bar.finish_and_clear();
 
     // Wave 2: duplicates (their dependency's outcome is final now).
-    let done = |id: usize| matches!(outcomes[id], Some(Outcome::Transferred { .. }));
-    let dep_ok: Vec<bool> = plan
+    let dependency = |id: usize| match &outcomes[id] {
+        Some(Outcome::Transferred { .. }) => Dependency::Done,
+        // A transfer skipped by a stop never failed; the duplicate inherits
+        // the stop's reason so it is reported (and counted) the same way.
+        Some(Outcome::NotRun(why @ (NotRun::Interrupted | NotRun::DiskFull))) => {
+            Dependency::Stopped(*why)
+        }
+        _ => Dependency::Failed,
+    };
+    let deps: Vec<Dependency> = plan
         .actions
         .iter()
         .map(|a| match a {
             Action::Duplicate {
                 depends_on: Some(id),
                 ..
-            } => done(*id),
-            _ => true,
+            } => dependency(*id),
+            _ => Dependency::Done,
         })
         .collect();
     let wave2: Vec<(usize, Outcome)> = io_pool.install(|| {
@@ -244,7 +272,7 @@ pub fn execute(
             .par_iter()
             .enumerate()
             .filter(|(_, a)| matches!(a, Action::Duplicate { .. }))
-            .map(|(i, a)| (i, ex.duplicate(a, dep_ok[i])))
+            .map(|(i, a)| (i, ex.duplicate(a, deps[i])))
             .collect()
     });
     for (i, o) in wave2 {
@@ -353,7 +381,7 @@ impl Exec<'_> {
         self.bar.inc(1);
     }
 
-    fn duplicate(&self, a: &Action, dependency_ok: bool) -> Outcome {
+    fn duplicate(&self, a: &Action, dependency: Dependency) -> Outcome {
         let Action::Duplicate {
             src,
             of,
@@ -365,13 +393,25 @@ impl Exec<'_> {
         else {
             unreachable!("only duplicates reach wave 2")
         };
-        if !dependency_ok {
-            log::error!(
-                "{}: not processed: the transfer to {} failed",
-                src.display(),
-                of.display()
-            );
-            return Outcome::NotRun(NotRun::DependencyFailed);
+        match dependency {
+            Dependency::Done => {}
+            Dependency::Stopped(why) => {
+                log::warn!(
+                    "{}: not run ({}): the transfer to {} did not run",
+                    src.display(),
+                    stop_label(why),
+                    of.display()
+                );
+                return Outcome::NotRun(why);
+            }
+            Dependency::Failed => {
+                log::error!(
+                    "{}: not processed: the transfer to {} failed",
+                    src.display(),
+                    of.display()
+                );
+                return Outcome::NotRun(NotRun::DependencyFailed);
+            }
         }
         let outcome = if *delete {
             if let Some(why) = self.stop.reason() {

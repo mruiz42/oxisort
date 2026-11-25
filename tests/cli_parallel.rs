@@ -231,3 +231,38 @@ fn disk_full_stop_reports_not_run_and_exit_1() {
             .contains("destination full")
     );
 }
+
+/// F2: a duplicate whose transfer never ran because of Ctrl-C is "not run
+/// (interrupted)", not a dependency failure, and the summary says so.
+#[test]
+fn interrupt_reports_pending_duplicates_as_interrupted() {
+    let env = Env::new();
+    env.add("dto.jpg", "dto.jpg");
+    env.add("dto.jpg", "sub/dto_copy.jpg");
+    let (cfg, pools, scanned, plan) = planned(&env);
+    assert!(
+        plan.actions
+            .iter()
+            .any(|a| matches!(a, oxisort::model::Action::Duplicate { .. })),
+        "fixture must plan a duplicate"
+    );
+    let stop = Stop::new();
+    stop.request(NotRun::Interrupted);
+    let outcomes = exec::execute(&plan, cfg.mode, &pools.io, &stop, &Progress::disabled());
+    assert_eq!(
+        outcomes,
+        [
+            Outcome::NotRun(NotRun::Interrupted),
+            Outcome::NotRun(NotRun::Interrupted)
+        ]
+    );
+    let summary = oxisort::summarize(&cfg, &scanned, &plan, &outcomes);
+    assert_eq!(summary.exit_code(), 130);
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    let text = summary.render(cfg.mode, Default::default(), 2);
+    assert!(
+        text.starts_with("oxisort: copy interrupted after"),
+        "{text}"
+    );
+    assert!(text.contains("not run:          2 (interrupted)"), "{text}");
+}
