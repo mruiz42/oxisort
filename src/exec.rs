@@ -19,7 +19,7 @@ use rayon::prelude::*;
 
 use crate::fsops::{self, FsError, MoveHow};
 use crate::logging::{ACTION, Progress};
-use crate::model::{Action, Mode, NotRun, Outcome};
+use crate::model::{Action, DupHandling, DupHow, Mode, NotRun, Outcome};
 use crate::plan::{self, Plan};
 
 /// Cooperative stop flag: set by SIGINT or a full destination; checked by
@@ -86,13 +86,18 @@ fn action_line(action: &Action, mode: Mode, outcome: &Outcome) -> Option<String>
             Action::Duplicate {
                 src,
                 of,
+                handling,
                 sidecars_left,
                 ..
             },
-            Outcome::Duplicate { deleted },
+            Outcome::Duplicate { how },
         ) => {
-            let verb = if *deleted { "dup-deleted" } else { "dup" };
-            let mut s = format!("{verb} {} == {}", src.display(), of.display());
+            let (src, of) = (src.display(), of.display());
+            let mut s = match (how, handling) {
+                (DupHow::Deleted, _) => format!("dup-deleted {src} == {of}"),
+                (_, DupHandling::KeepSameFile) => format!("dup {src} == {of} (same file, kept)"),
+                _ => format!("dup {src} == {of}"),
+            };
             for sc in sidecars_left {
                 s.push_str(&format!("\n  sidecar left in place {}", sc.display()));
             }
@@ -136,10 +141,19 @@ fn predicted(a: &Action) -> Outcome {
             sidecars: sidecars.len(),
             sidecar_errors: Vec::new(),
         },
-        Action::Duplicate { delete, .. } => Outcome::Duplicate { deleted: *delete },
+        Action::Duplicate { handling, .. } => Outcome::Duplicate {
+            how: predicted_dup(handling),
+        },
         Action::AlreadyInPlace { .. } => Outcome::AlreadyInPlace,
         Action::Skip { reason, .. } => Outcome::Skipped(*reason),
         Action::Fail { error, .. } => Outcome::Failed(error.clone()),
+    }
+}
+
+fn predicted_dup(handling: &DupHandling) -> DupHow {
+    match handling {
+        DupHandling::Delete => DupHow::Deleted,
+        DupHandling::Report | DupHandling::KeepSameFile => DupHow::Reported,
     }
 }
 
@@ -385,7 +399,7 @@ impl Exec<'_> {
         let Action::Duplicate {
             src,
             of,
-            delete,
+            handling,
             size,
             dev_ino,
             ..
@@ -413,20 +427,20 @@ impl Exec<'_> {
                 return Outcome::NotRun(NotRun::DependencyFailed);
             }
         }
-        let outcome = if *delete {
-            if let Some(why) = self.stop.reason() {
-                return Outcome::NotRun(why);
-            }
-            match delete_verified(src, of, *size, *dev_ino) {
-                Ok(()) => Outcome::Duplicate { deleted: true },
-                Err(msg) => {
+        let how = match handling {
+            DupHandling::Delete => {
+                if let Some(why) = self.stop.reason() {
+                    return Outcome::NotRun(why);
+                }
+                if let Err(msg) = delete_verified(src, of, *size, *dev_ino) {
                     log::error!("{}: {msg}", src.display());
                     return Outcome::Failed(msg);
                 }
+                DupHow::Deleted
             }
-        } else {
-            Outcome::Duplicate { deleted: false }
+            DupHandling::Report | DupHandling::KeepSameFile => DupHow::Reported,
         };
+        let outcome = Outcome::Duplicate { how };
         if let Some(line) = action_line(a, self.mode, &outcome) {
             emit(&line);
         }

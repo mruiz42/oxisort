@@ -155,7 +155,7 @@ pub struct Config {
     pub skip_unknown: bool,
     /// `0` = only files directly in the input folder.
     pub max_depth: Option<usize>,
-    pub delete_duplicates: bool,
+    pub duplicates: Duplicates,
     pub rmdirs: bool,
     pub jobs: usize,
     pub io_jobs: usize,
@@ -163,6 +163,34 @@ pub struct Config {
     pub progress: bool,
     /// Absolute path of the `--log` file, if any (excluded from the scan).
     pub log_file: Option<PathBuf>,
+}
+
+/// What happens to an input whose content already exists (plan A1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DupPolicy {
+    /// Report only; the source and its sidecars stay (`--skip-duplicates`).
+    Skip,
+    /// Delete the verified source (`--move --delete-duplicates`).
+    Delete,
+}
+
+/// Duplicate handling for the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Duplicates {
+    pub policy: DupPolicy,
+}
+
+/// How the plan handles one duplicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DupHandling {
+    /// Report only.
+    Report,
+    /// Delete the source after re-verifying it (`--delete-duplicates`).
+    Delete,
+    /// `--delete-duplicates`, but the source is the same inode as the file
+    /// it duplicates (a hard link): deleting it would lose nothing on disk
+    /// yet remove a name the user made, so it is kept and reported.
+    KeepSameFile,
 }
 
 /// Why a file was deliberately not processed.
@@ -212,8 +240,7 @@ pub enum Action {
     Duplicate {
         src: PathBuf,
         of: PathBuf,
-        /// Delete the source (`--move --delete-duplicates`).
-        delete: bool,
+        handling: DupHandling,
         /// The transfer that will create `of`, if it isn't there yet.
         depends_on: Option<usize>,
         size: u64,
@@ -251,6 +278,13 @@ pub enum NotRun {
     DependencyFailed,
 }
 
+/// What was done with a duplicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DupHow {
+    Reported,
+    Deleted,
+}
+
 /// What actually happened to one action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -261,7 +295,7 @@ pub enum Outcome {
         sidecar_errors: Vec<String>,
     },
     Duplicate {
-        deleted: bool,
+        how: DupHow,
     },
     AlreadyInPlace,
     Skipped(SkipReason),

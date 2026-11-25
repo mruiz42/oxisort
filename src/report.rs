@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::exec::Stop;
-use crate::model::{Action, Kind, Mode, NotRun, Outcome, SkipReason};
+use crate::model::{Action, DupHow, Kind, Mode, NotRun, Outcome, SkipReason};
 use crate::scan::ScanCounts;
 
 /// How many error messages the summary lists before "and N more".
@@ -58,9 +58,9 @@ impl RunSummary {
                 self.sidecars += sidecars;
                 self.errors.extend(sidecar_errors.iter().cloned());
             }
-            Outcome::Duplicate { deleted } => {
+            Outcome::Duplicate { how } => {
                 self.duplicates += 1;
-                if *deleted {
+                if *how == DupHow::Deleted {
                     self.duplicates_deleted += 1;
                 }
             }

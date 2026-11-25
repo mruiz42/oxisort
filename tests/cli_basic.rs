@@ -100,7 +100,6 @@ fn every_fixture_lands_in_the_right_place() {
             "2017/01/02/20170102-030405123.jpg", // DTO + subsec, offset ignored
             "2018/02/03/20180203-040506.jpg",    // CreateDate only
             "2018/03/04/20180304-050607.jpg",    // ModifyDate only
-            "2019/03/04/20190304-050607.arw",    // TIFF data, RAW extension
             "2019/03/04/20190304-050607.heic",
             "2019/03/04/20190304-050607.png",
             "2019/03/04/20190304-050607.tiff",
@@ -121,8 +120,21 @@ fn every_fixture_lands_in_the_right_place() {
         fs::read(env.output.join("2016/09/15/20160915-123456.jpg")).unwrap(),
         fs::read(fixture("20160915_123456.jpg")).unwrap()
     );
+    // fake.arw is a byte copy of a.tiff: a duplicate, whatever its name
+    // or extension (global rule, plan amendment A1).
+    let dup_line = format!(
+        "dup {} == {}",
+        env.input.join("fake.arw").display(),
+        env.output.join("2019/03/04/20190304-050607.tiff").display()
+    );
+    assert!(
+        stdout(&out).lines().any(|l| l == dup_line),
+        "{}",
+        stdout(&out)
+    );
     let err = stderr(&out);
-    assert!(err.contains("(images 13, videos 5, other 1)"), "{err}");
+    assert!(err.contains("(images 12, videos 5, other 1)"), "{err}");
+    assert!(err.contains("duplicates:       1"), "{err}");
     assert!(err.contains("no date:          5"), "{err}");
 }
 
@@ -183,7 +195,10 @@ fn date_field_order_and_selection() {
 fn custom_regex_and_timestamp() {
     let env = Env::new();
     env.add("base.jpg", "holiday 15.09.2016.jpg");
-    let plain = env.add("base.jpg", "plain.jpg");
+    // Different bytes, or plain.jpg would be a duplicate of the first.
+    let mut bytes = fs::read(fixture("base.jpg")).unwrap();
+    bytes.push(0);
+    let plain = env.write("plain.jpg", &bytes);
     env.write("IMG_20160915_123456.txt", b"not media");
     let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_420_167_845);
     fs::File::options()

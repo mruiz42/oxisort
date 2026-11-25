@@ -13,7 +13,7 @@ use clap::Parser;
 
 use crate::date::{DEFAULT_REGEX, FilenameRegex, parse_tz};
 use crate::dateformat::DirFormat;
-use crate::model::{Config, DateField, Kind, Mode, Verbosity, Zone};
+use crate::model::{Config, DateField, DupPolicy, Duplicates, Kind, Mode, Verbosity, Zone};
 
 const DATE_FIELD_HELP: &str = "Date sources, in priority order (space or comma separated, \
 case-insensitive): DateTimeOriginal, CreateDate (alias DateTimeDigitized), ModifyDate \
@@ -257,7 +257,13 @@ impl Args {
             skip_unknown: self.skip_unknown,
             // walkdir depth: files directly in INPUT are depth 1.
             max_depth: self.max_depth.map(usize::from),
-            delete_duplicates: self.delete_duplicates,
+            duplicates: Duplicates {
+                policy: if self.delete_duplicates {
+                    DupPolicy::Delete
+                } else {
+                    DupPolicy::Skip
+                },
+            },
             rmdirs: self.rmdirs,
             jobs,
             io_jobs: usize::from(self.io_jobs),

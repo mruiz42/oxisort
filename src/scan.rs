@@ -105,7 +105,7 @@ pub fn is_junk(name: &OsStr) -> bool {
         || name.eq_ignore_ascii_case("desktop.ini")
 }
 
-fn is_skipped_dir(name: &OsStr) -> bool {
+pub(crate) fn is_skipped_dir(name: &OsStr) -> bool {
     let name = name.to_string_lossy();
     SKIP_DIRS.contains(&name.as_ref())
         || Path::new(name.as_ref())

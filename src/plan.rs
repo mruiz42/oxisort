@@ -2,13 +2,17 @@
 //! so the result is deterministic and dry-run shows exactly what a real run
 //! does. Worker threads later only execute these decisions.
 //!
-//! Steps (plan 4a–4d):
+//! Steps (plan 4a–4d, amendment A1):
 //! - 4a: target folder and base name per file ([`target_for`]);
-//! - 4b: list each target folder once ([`DestIndex`]), stat the existing
-//!   files that share a name chain with some input;
-//! - 4c: hash (blake3) only files whose size collides within a chain;
-//! - 4d: walk the inputs in order and give each the first free
-//!   `stem[-n].ext`, detecting duplicates and files already in place.
+//! - 4b: list each target folder once ([`DestIndex`]) for name occupancy,
+//!   and stat the existing files that share a name chain with some input
+//!   (the in-place test); walk all of OUT ([`OutIndex`]);
+//! - 4c: hash, size first, every file whose size collides with an input
+//!   anywhere in OUT or the input ([`dedupe`]);
+//! - 4d: walk the inputs in order: same inode as an OUT file → in place;
+//!   a non-keeper of its content class → duplicate; else the first free
+//!   `stem[-n].ext` for its whole bundle. Duplicate detection never looks
+//!   at names, so a free slot can't hide a match (validation F1).
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -19,10 +23,11 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::Pools;
+use crate::dedupe::{self, ContentKey, Member, OutIndex, WalkSkip};
 use crate::exec::Stop;
 use crate::extract::{ExtractError, Extracted};
-use crate::hash;
-use crate::model::{Action, Config, Kind, Mode, PlannedSidecar, SkipReason};
+use crate::hash::DevIno;
+use crate::model::{Action, Config, DupHandling, DupPolicy, Kind, PlannedSidecar, SkipReason};
 use crate::scan::{DirInfo, Sidecar, SidecarForm, is_junk};
 
 /// The complete plan for a run.
@@ -242,14 +247,40 @@ pub fn build(
     dirs.dedup();
     let mut index = DestIndex::load(&dirs, &pools.cpu);
     index.stat_chains(&cands, &pools.cpu);
+    // INPUT inside OUT (or equal to it): its files are candidates, not
+    // existing output. Compared by identity, like the duplicates folder.
+    let skip_dirs: Vec<DevIno> = crate::fsops::dev_ino(&cfg.input).into_iter().collect();
+    let out = OutIndex::build(
+        &cfg.output,
+        WalkSkip {
+            dirs: &skip_dirs,
+            file: cfg.log_file.as_deref(),
+        },
+        &pools.cpu,
+        stop,
+    );
     // Hashing reads whole files, so it runs on the io pool: `--io-jobs`
-    // bounds concurrent full reads and spinning disks or SD cards aren't
+    // bounds concurrent reads and spinning disks or SD cards aren't
     // thrashed (listing and stat above are metadata-only).
-    let hashes = hash::hash_all(&hash_set(&cands, &index), &pools.io, stop);
+    let members: Vec<Member<'_>> = cands
+        .iter()
+        .map(|c| Member {
+            path: &c.src,
+            size: c.size,
+            dev_ino: c.dev_ino,
+            candidate: true,
+        })
+        .chain(out.files().iter().map(|f| Member {
+            path: &f.path,
+            size: f.size,
+            dev_ino: f.dev_ino,
+            candidate: false,
+        }))
+        .collect();
+    let hashes = dedupe::hash_contents(&members, &pools.io, stop);
 
-    let delete = cfg.delete_duplicates && cfg.mode == Mode::Move;
-    let actions = resolve(staged, &index, &hashes, delete);
-    let rmdirs = if cfg.rmdirs && cfg.mode == Mode::Move {
+    let actions = resolve(staged, &index, &out, &hashes, cfg.duplicates.policy);
+    let rmdirs = if cfg.rmdirs && cfg.mode == crate::model::Mode::Move {
         plan_rmdirs(dirs_scanned, &actions, &cfg.input)
     } else {
         Vec::new()
@@ -298,7 +329,9 @@ pub(crate) fn plan_rmdirs(dirs: &[DirInfo], actions: &[Action], input: &Path) ->
                 protected.extend(dst.ancestors().skip(1).map(Path::to_path_buf));
             }
             Action::Duplicate {
-                src, delete: true, ..
+                src,
+                handling: DupHandling::Delete,
+                ..
             } => count_removed(src),
             _ => {}
         }
@@ -343,119 +376,52 @@ fn candidate(x: Extracted, cfg: &Config) -> Candidate {
     }
 }
 
-/// Plan step 4c: the files worth hashing. Within each chain, group members
-/// (existing regular files and inputs) by size; a group that holds an input
-/// and at least two distinct files is hashed in full. Cheap
-/// over-approximation, deterministic.
-fn hash_set(cands: &[&Candidate], index: &DestIndex) -> Vec<PathBuf> {
-    type Group = (Vec<PathBuf>, HashSet<(u64, u64)>, bool);
-    let mut groups: HashMap<(ChainKey, u64), Group> = HashMap::new();
-    let mut seen_keys: HashSet<ChainKey> = HashSet::new();
-    for c in cands {
-        for key in candidate_keys(c) {
-            let g = groups.entry((key.clone(), c.size)).or_default();
-            g.0.push(c.src.clone());
-            g.1.insert(c.dev_ino);
-            g.2 = true;
-            seen_keys.insert(key);
-        }
-    }
-    for key in seen_keys {
-        for name in index.chains.get(&key).into_iter().flatten() {
-            let Some(e) = index.get(&key.0, name) else {
-                continue;
-            };
-            let Some(info) = e.info.filter(|i| !i.symlink) else {
-                continue;
-            };
-            if let Some(g) = groups.get_mut(&(key.clone(), info.size)) {
-                g.0.push(e.path.clone());
-                g.1.insert(info.dev_ino);
-            }
-        }
-    }
-    let mut paths: Vec<PathBuf> = groups
-        .into_values()
-        .filter(|(_, ids, has_input)| *has_input && ids.len() >= 2)
-        .flat_map(|(paths, _, _)| paths)
-        .collect();
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
-/// Something an input can turn out to be a copy of: the holder of name
-/// `stem[-n].ext` in some chain.
-#[derive(Debug, Clone)]
-enum Holder {
-    /// A transfer planned earlier in this run.
-    Planned { task: usize, dst: PathBuf },
-    /// A file already in the target folder.
-    Existing { path: PathBuf },
-}
-
-/// Holders at their chain positions `n`.
-type Positions = Vec<(u32, Holder)>;
-
-/// Holders keyed by what makes them match an input, so a candidate finds
-/// its duplicate in O(1) instead of walking its whole name chain. Each
-/// entry records the holder's position `n` in the chain.
+/// Inputs whose own name chain already holds their inode, i.e. files that
+/// already sit at one of their own target names (organizing in place, or a
+/// link/symlink rerun). Any chain position counts, so a file at `x-3.jpg`
+/// stays put even when `x-2.jpg` is free (rev 1's V4).
 #[derive(Debug, Default)]
-struct MatchIndex {
-    by_ino: HashMap<(ChainKey, (u64, u64)), Positions>,
-    /// Equal hashes imply equal content and size, which is finer than the
-    /// size lookup the review asked for: only true duplicates are listed.
-    by_hash: HashMap<(ChainKey, blake3::Hash), Positions>,
+struct ChainInodes {
+    /// `(chain, inode)` → the lowest `(n, path)` holding it.
+    by_ino: HashMap<(ChainKey, DevIno), (u32, PathBuf)>,
 }
 
-impl MatchIndex {
-    fn add(
-        &mut self,
-        dir: &Path,
-        name: &OsStr,
-        dev_ino: (u64, u64),
-        hash: Option<blake3::Hash>,
-        holder: &Holder,
-    ) {
-        for (key, n) in chain_positions(dir, Path::new(name)) {
-            if let Some(h) = hash {
-                self.by_hash
-                    .entry((key.clone(), h))
-                    .or_default()
-                    .push((n, holder.clone()));
+impl ChainInodes {
+    fn new(index: &DestIndex) -> Self {
+        let mut by_ino: HashMap<(ChainKey, DevIno), (u32, PathBuf)> = HashMap::new();
+        for e in index.dirs.values().flat_map(HashMap::values) {
+            let (Some(info), Some(dir), Some(name)) = (e.info, e.path.parent(), e.path.file_name())
+            else {
+                continue;
+            };
+            for (key, n) in chain_positions(dir, Path::new(name)) {
+                let cand = (n, e.path.clone());
+                by_ino
+                    .entry((key, info.dev_ino))
+                    .and_modify(|cur| {
+                        if cand < *cur {
+                            *cur = cand.clone();
+                        }
+                    })
+                    .or_insert(cand);
             }
-            self.by_ino
-                .entry((key, dev_ino))
-                .or_default()
-                .push((n, holder.clone()));
         }
+        ChainInodes { by_ino }
     }
 
-    /// The match the original chain walk would stop at: the lowest position
-    /// below `limit` (the free slot), an inode match winning a tie.
-    fn first(
-        &self,
-        key: &ChainKey,
-        c: &Candidate,
-        hash: Option<blake3::Hash>,
-        limit: u32,
-    ) -> Option<(bool, &Holder)> {
-        let ino = self
-            .by_ino
-            .get(&(key.clone(), c.dev_ino))
-            .into_iter()
-            .flatten()
-            .map(|(n, h)| ((*n, 0u8), (true, h)));
-        let content = hash
-            .and_then(|h| self.by_hash.get(&(key.clone(), h)))
-            .into_iter()
-            .flatten()
-            .map(|(n, h)| ((*n, 1u8), (false, h)));
-        ino.chain(content)
-            .filter(|((n, _), _)| *n < limit)
-            .min_by_key(|(rank, _)| *rank)
-            .map(|(_, m)| m)
+    /// The existing path in `c`'s own chain that has `c`'s inode, if any.
+    fn holder(&self, c: &Candidate) -> Option<&Path> {
+        self.by_ino
+            .get(&(own_chain(c), c.dev_ino))
+            .map(|(_, p)| p.as_path())
     }
+}
+
+/// The chain a candidate's names are drawn from (its stem at `n = 1`).
+fn own_chain(c: &Candidate) -> ChainKey {
+    let t = &c.target;
+    let first = numbered_name(&t.stem, t.ext.as_deref(), 1);
+    chain_positions(&t.dir, Path::new(&first)).swap_remove(0).0
 }
 
 /// The chains a name sits in, with its position `n` in each: its own stem
@@ -475,64 +441,169 @@ fn chain_positions(dir: &Path, name: &Path) -> Vec<(ChainKey, u32)> {
     out
 }
 
-/// Plan step 4d state. Correctness (no two tasks share a name, no existing
-/// name is reused) rests on `planned` + the `DestIndex` alone; `cursors`
-/// and `matches` only make the search fast. If a lookup key ever disagreed
-/// with the name map (exotic case folding), the effect is a missed
-/// duplicate, i.e. an extra `-n` copy, never an overwrite.
+/// The file a content class keeps; every other input of the class is a
+/// duplicate of it.
+#[derive(Debug, Clone)]
+enum Keeper {
+    /// Rule 1: an existing output file.
+    Existing { path: PathBuf, dev_ino: DevIno },
+    /// Rule 2: an input already in place; it stays where it is.
+    InPlace {
+        task: usize,
+        src: PathBuf,
+        dev_ino: DevIno,
+    },
+    /// Rule 3: the first input of the class, transferred by this run.
+    Planned {
+        task: usize,
+        dst: PathBuf,
+        dev_ino: DevIno,
+    },
+}
+
+/// Plan step 4d state for naming. Correctness (no two tasks share a name,
+/// no existing name is reused) rests on `planned` + the `DestIndex` alone;
+/// `cursors` only make the search fast.
 struct Resolver<'a> {
     index: &'a DestIndex,
-    hashes: &'a HashMap<PathBuf, blake3::Hash>,
-    delete: bool,
     /// Every name planned so far (main files and sidecars), case-folded.
     planned: HashSet<(PathBuf, String)>,
     /// Per chain: every `n` below the cursor is known to be occupied.
     /// Occupancy only grows, so the cursor never has to move back.
     cursors: HashMap<ChainKey, u32>,
-    matches: MatchIndex,
 }
 
-/// Plan step 4d (pure): assigns final names in input order.
+/// Plan step 4d (pure): classifies every input and assigns final names, in
+/// input order.
+///
+/// - `index`: names in the target folders (occupancy) and the stat of
+///   chain members (in-place test);
+/// - `out`: every regular file and symlink under OUT;
+/// - `hashes`: full hashes per inode, as selected by `dedupe::size_groups`
+///   (an inode without one is unique, or unreadable: never a duplicate).
+///
+/// Keeper rules per content class (amendment A1): (1) the first existing
+/// output file by `(folder, n, name)`; else (2) the first input already in
+/// place, by the same order of its holder; else (3) the first input in
+/// input order, which is transferred. An input with the same inode as any
+/// OUT file is in place (A1-Q2); empty files are never duplicates.
 pub(crate) fn resolve(
     staged: Vec<Result<Candidate, Action>>,
     index: &DestIndex,
-    hashes: &HashMap<PathBuf, blake3::Hash>,
-    delete_duplicates: bool,
+    out: &OutIndex,
+    hashes: &HashMap<DevIno, blake3::Hash>,
+    policy: DupPolicy,
 ) -> Vec<Action> {
-    let mut matches = MatchIndex::default();
-    for existing in index.dirs.values().flat_map(HashMap::values) {
-        let (Some(info), Some(dir), Some(name)) = (
-            existing.info,
-            existing.path.parent(),
-            existing.path.file_name(),
-        ) else {
-            continue;
-        };
-        // A symlink is never a duplicate copy, but a link to the input
-        // still counts as already in place (inode match).
-        let hash = (!info.symlink)
-            .then(|| hashes.get(&existing.path).copied())
-            .flatten();
-        let holder = Holder::Existing {
-            path: existing.path.clone(),
-        };
-        matches.add(dir, name, info.dev_ino, hash, &holder);
+    let chain_inodes = ChainInodes::new(index);
+    let out_holders = out.holders();
+    let key_of = |c: &Candidate| dedupe::content_key(c.size, c.dev_ino, hashes);
+
+    let mut keepers: HashMap<ContentKey, Keeper> = dedupe::existing_keepers(out, hashes)
+        .into_iter()
+        .map(|(k, f)| {
+            let keeper = Keeper::Existing {
+                path: f.path.clone(),
+                dev_ino: f.dev_ino,
+            };
+            (k, keeper)
+        })
+        .collect();
+    for (key, keeper) in in_place_keepers(&staged, &chain_inodes, &out_holders, &key_of) {
+        keepers.entry(key).or_insert(keeper);
     }
+
     let mut r = Resolver {
         index,
-        hashes,
-        delete: delete_duplicates,
         planned: HashSet::new(),
         cursors: HashMap::new(),
-        matches,
     };
     staged
         .into_iter()
         .enumerate()
-        .map(|(task, s)| match s {
-            Ok(c) => r.place(task, c),
-            Err(action) => action,
+        .map(|(task, s)| {
+            let c = match s {
+                Ok(c) => c,
+                Err(action) => return action,
+            };
+            if out_holders.contains_key(&c.dev_ino) {
+                return Action::AlreadyInPlace { src: c.src };
+            }
+            if c.size == 0 {
+                if chain_inodes.holder(&c).is_some() {
+                    return Action::AlreadyInPlace { src: c.src };
+                }
+                return r.place(c);
+            }
+            let key = key_of(&c);
+            match keepers.get(&key).cloned() {
+                Some(Keeper::Existing { path, dev_ino }) => {
+                    duplicate(c, path, dev_ino, None, policy)
+                }
+                Some(Keeper::InPlace { task: k, .. }) if k == task => {
+                    Action::AlreadyInPlace { src: c.src }
+                }
+                Some(Keeper::InPlace { src, dev_ino, .. }) => {
+                    duplicate(c, src, dev_ino, None, policy)
+                }
+                Some(Keeper::Planned {
+                    task: k,
+                    dst,
+                    dev_ino,
+                }) => duplicate(c, dst, dev_ino, Some(k), policy),
+                None => {
+                    let dev_ino = c.dev_ino;
+                    let action = r.place(c);
+                    // A failed placement leaves the class open, so the next
+                    // input of the class becomes its keeper.
+                    if let Action::Transfer { dst, .. } = &action {
+                        let dst = dst.clone();
+                        keepers.insert(key, Keeper::Planned { task, dst, dev_ino });
+                    }
+                    action
+                }
+            }
         })
+        .collect()
+}
+
+/// Rule 2 keepers: per class, the in-place input whose holder comes first
+/// by `(folder, n, name)`; among inputs sharing one holder (hard links),
+/// the one that *is* the holder, then input order. That keeper never
+/// moves, so the others can safely be its duplicates.
+fn in_place_keepers(
+    staged: &[Result<Candidate, Action>],
+    chain_inodes: &ChainInodes,
+    out_holders: &HashMap<DevIno, &Path>,
+    key_of: &impl Fn(&Candidate) -> ContentKey,
+) -> HashMap<ContentKey, Keeper> {
+    type Rank = ((PathBuf, u32, OsString), bool, usize);
+    let mut best: HashMap<ContentKey, (Rank, Keeper)> = HashMap::new();
+    for (task, c) in staged.iter().enumerate() {
+        let Ok(c) = c else { continue };
+        if c.size == 0 {
+            continue;
+        }
+        let holder = out_holders
+            .get(&c.dev_ino)
+            .copied()
+            .or_else(|| chain_inodes.holder(c));
+        let Some(holder) = holder else { continue };
+        let rank: Rank = (dedupe::order_key(holder), c.src != holder, task);
+        let keeper = Keeper::InPlace {
+            task,
+            src: c.src.clone(),
+            dev_ino: c.dev_ino,
+        };
+        best.entry(key_of(c))
+            .and_modify(|cur| {
+                if rank < cur.0 {
+                    *cur = (rank.clone(), keeper.clone());
+                }
+            })
+            .or_insert((rank, keeper));
+    }
+    best.into_iter()
+        .map(|(k, (_, keeper))| (k, keeper))
         .collect()
 }
 
@@ -544,52 +615,34 @@ impl Resolver<'_> {
                 .contains(&(dir.to_path_buf(), folded.to_owned()))
     }
 
-    /// Equivalent to walking `n = 1, 2, …` and stopping at the first name
-    /// that is either a copy of `c` or free for its whole bundle (main
-    /// name plus sidecars): find the free slot from the chain's cursor,
-    /// then take any match below it.
-    fn place(&mut self, task: usize, c: Candidate) -> Action {
-        let t = &c.target;
-        let first = numbered_name(&t.stem, t.ext.as_deref(), 1);
-        let (key, _) = chain_positions(&t.dir, Path::new(&first)).swap_remove(0);
-        let Some((n, name, side_names)) = self.free_slot(&key, &c) else {
+    /// Gives `c` the lowest `n` whose whole bundle (main name plus sidecar
+    /// names) is free, and reserves those names.
+    fn place(&mut self, c: Candidate) -> Action {
+        let key = own_chain(&c);
+        let Some((name, side_names)) = self.free_slot(&key, &c) else {
+            let t = &c.target;
             return Action::Fail {
                 error: format!("no free name left for {}", t.dir.join(&t.stem).display()),
                 src: c.src,
             };
         };
-        let hash = self.hashes.get(&c.src).copied();
-        if let Some((by_inode, holder)) = self.matches.first(&key, &c, hash, n) {
-            return match holder.clone() {
-                Holder::Existing { .. } if by_inode => Action::AlreadyInPlace { src: c.src },
-                Holder::Existing { path } => duplicate(c, path, self.delete, None),
-                // Same inode (hard links in the input): never deleted.
-                Holder::Planned { task, dst } if by_inode => duplicate(c, dst, false, Some(task)),
-                Holder::Planned { task, dst } => duplicate(c, dst, self.delete, Some(task)),
-            };
-        }
-        let dst = t.dir.join(&name);
-        self.planned.insert((t.dir.clone(), fold(&name)));
+        let dir = &c.target.dir;
+        self.planned.insert((dir.clone(), fold(&name)));
         for s in &side_names {
-            self.planned.insert((t.dir.clone(), fold(s)));
+            self.planned.insert((dir.clone(), fold(s)));
         }
-        let holder = Holder::Planned {
-            task,
-            dst: dst.clone(),
-        };
-        self.matches.add(&t.dir, &name, c.dev_ino, hash, &holder);
         let sidecars = c
             .sidecars
             .iter()
             .zip(side_names)
             .map(|(s, n)| PlannedSidecar {
                 src: s.path.clone(),
-                dst: t.dir.join(n),
+                dst: dir.join(n),
             })
             .collect();
         Action::Transfer {
+            dst: dir.join(&name),
             src: c.src,
-            dst,
             kind: c.kind,
             dated: c.dated,
             size: c.size,
@@ -601,11 +654,7 @@ impl Resolver<'_> {
     /// starting at the chain's cursor (amortised O(1) per input even when
     /// thousands of files share one timestamp). `None` only if `u32` runs
     /// out, which needs more files than any filesystem folder can hold.
-    fn free_slot(
-        &mut self,
-        key: &ChainKey,
-        c: &Candidate,
-    ) -> Option<(u32, OsString, Vec<OsString>)> {
+    fn free_slot(&mut self, key: &ChainKey, c: &Candidate) -> Option<(OsString, Vec<OsString>)> {
         let t = &c.target;
         let mut n = self.cursors.get(key).copied().unwrap_or(1);
         let mut advancing = true;
@@ -624,7 +673,7 @@ impl Resolver<'_> {
                     .map(|s| sidecar_name(&name, &stem_n, s, t.generated))
                     .collect();
                 if !side_names.iter().any(|s| self.taken(&t.dir, &fold(s))) {
-                    return Some((n, name, side_names));
+                    return Some((name, side_names));
                 }
             }
             n = n.checked_add(1)?;
@@ -632,10 +681,23 @@ impl Resolver<'_> {
     }
 }
 
-fn duplicate(c: Candidate, of: PathBuf, delete: bool, depends_on: Option<usize>) -> Action {
+/// A duplicate of `of` under the run's policy. A hard link to `of` is
+/// never deleted: removing it frees nothing and drops a name the user made.
+fn duplicate(
+    c: Candidate,
+    of: PathBuf,
+    of_dev_ino: DevIno,
+    depends_on: Option<usize>,
+    policy: DupPolicy,
+) -> Action {
+    let handling = match policy {
+        DupPolicy::Skip => DupHandling::Report,
+        DupPolicy::Delete if c.dev_ino == of_dev_ino => DupHandling::KeepSameFile,
+        DupPolicy::Delete => DupHandling::Delete,
+    };
     Action::Duplicate {
         of,
-        delete,
+        handling,
         depends_on,
         size: c.size,
         dev_ino: c.dev_ino,
@@ -742,6 +804,8 @@ pub fn target_dirs(plan: &Plan) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::Stop;
+    use crate::hash::{self, Rep};
 
     const OUT: &str = "/out/2017/01/02";
 
@@ -762,11 +826,19 @@ mod tests {
         }
     }
 
-    fn hashes(pairs: &[(&str, u8)]) -> HashMap<PathBuf, blake3::Hash> {
-        pairs
-            .iter()
-            .map(|(p, h)| (PathBuf::from(p), blake3::hash(&[*h])))
-            .collect()
+    fn with_sidecars(mut c: Candidate, forms: &[SidecarForm]) -> Candidate {
+        for form in forms {
+            let suffix = match form {
+                SidecarForm::WithExt => ".jpg.xmp",
+                SidecarForm::StemOnly => ".xmp",
+            };
+            let src = c.src.with_extension("").display().to_string() + suffix;
+            c.sidecars.push(Sidecar {
+                path: src.into(),
+                form: *form,
+            });
+        }
+        c
     }
 
     fn info(size: u64, ino: u64) -> Option<FileInfo> {
@@ -777,6 +849,42 @@ mod tests {
         })
     }
 
+    /// The plan's view of the world: target-folder names, OUT, hashes.
+    #[derive(Default)]
+    struct World {
+        dest: DestIndex,
+        out: OutIndex,
+        hashes: HashMap<DevIno, blake3::Hash>,
+    }
+
+    impl World {
+        /// An existing regular output file; `content` = Some(byte) if it
+        /// was hashed (its size collides with an input).
+        fn file(&mut self, dir: &str, name: &str, size: u64, ino: u64, content: Option<u8>) {
+            self.dest
+                .insert(Path::new(dir), OsStr::new(name), info(size, ino));
+            self.out
+                .insert_file(Path::new(dir).join(name), size, (1, ino));
+            if let Some(b) = content {
+                self.content(ino, b);
+            }
+        }
+
+        /// A name that only blocks a slot (a stale sidecar, say).
+        fn occupied(&mut self, dir: &str, name: &str) {
+            self.dest.insert(Path::new(dir), OsStr::new(name), None);
+        }
+
+        fn content(&mut self, ino: u64, b: u8) {
+            self.hashes.insert((1, ino), blake3::hash(&[b]));
+        }
+
+        fn resolve(&self, cands: Vec<Candidate>, policy: DupPolicy) -> Vec<Action> {
+            let staged = cands.into_iter().map(Ok).collect();
+            resolve(staged, &self.dest, &self.out, &self.hashes, policy)
+        }
+    }
+
     fn dst(a: &Action) -> String {
         match a {
             Action::Transfer { dst, .. } => dst.display().to_string(),
@@ -784,14 +892,33 @@ mod tests {
         }
     }
 
+    /// `(of, depends_on, handling)` of a duplicate.
+    fn dup(a: &Action) -> (String, Option<usize>, DupHandling) {
+        match a {
+            Action::Duplicate {
+                of,
+                depends_on,
+                handling,
+                ..
+            } => (of.display().to_string(), *depends_on, handling.clone()),
+            other => panic!("expected duplicate, got {other:?}"),
+        }
+    }
+
+    fn in_place(a: &Action) -> bool {
+        matches!(a, Action::AlreadyInPlace { .. })
+    }
+
     #[test]
     fn collision_chain() {
-        let staged = vec![
-            Ok(cand("/in/a.jpg", "x", 1, 11)),
-            Ok(cand("/in/b.jpg", "x", 2, 12)),
-            Ok(cand("/in/c.jpg", "X", 3, 13)), // case-folded collision
-        ];
-        let acts = resolve(staged, &DestIndex::default(), &HashMap::new(), false);
+        let acts = World::default().resolve(
+            vec![
+                cand("/in/a.jpg", "x", 1, 11),
+                cand("/in/b.jpg", "x", 2, 12),
+                cand("/in/c.jpg", "X", 3, 13), // case-folded collision
+            ],
+            DupPolicy::Skip,
+        );
         let got: Vec<String> = acts.iter().map(dst).collect();
         assert_eq!(
             got,
@@ -805,112 +932,87 @@ mod tests {
 
     #[test]
     fn duplicate_of_existing() {
-        let mut index = DestIndex::default();
-        index.insert(Path::new(OUT), OsStr::new("x.jpg"), info(5, 99));
-        let h = hashes(&[(&format!("{OUT}/x.jpg"), 7), ("/in/a.jpg", 7)]);
-        let acts = resolve(vec![Ok(cand("/in/a.jpg", "x", 5, 11))], &index, &h, true);
-        match &acts[0] {
-            Action::Duplicate {
-                of,
-                delete,
-                depends_on,
-                ..
-            } => {
-                assert_eq!(of, &PathBuf::from(format!("{OUT}/x.jpg")));
-                assert!(*delete);
-                assert_eq!(*depends_on, None);
-            }
-            other => panic!("{other:?}"),
-        }
+        let mut w = World::default();
+        w.file(OUT, "x.jpg", 5, 99, Some(7));
+        w.content(11, 7);
+        let acts = w.resolve(vec![cand("/in/a.jpg", "x", 5, 11)], DupPolicy::Delete);
+        assert_eq!(
+            dup(&acts[0]),
+            (format!("{OUT}/x.jpg"), None, DupHandling::Delete)
+        );
     }
 
     #[test]
     fn same_size_different_content_takes_next_name() {
-        let mut index = DestIndex::default();
-        index.insert(Path::new(OUT), OsStr::new("x.jpg"), info(5, 99));
-        let h = hashes(&[(&format!("{OUT}/x.jpg"), 7), ("/in/a.jpg", 8)]);
-        let acts = resolve(vec![Ok(cand("/in/a.jpg", "x", 5, 11))], &index, &h, false);
+        let mut w = World::default();
+        w.file(OUT, "x.jpg", 5, 99, Some(7));
+        w.content(11, 8);
+        let acts = w.resolve(vec![cand("/in/a.jpg", "x", 5, 11)], DupPolicy::Skip);
         assert_eq!(dst(&acts[0]), format!("{OUT}/x-2.jpg"));
     }
 
     #[test]
     fn duplicate_within_input_depends_on_first() {
-        let h = hashes(&[("/in/a.jpg", 1), ("/in/b.jpg", 1)]);
-        let staged = vec![
-            Ok(cand("/in/a.jpg", "x", 5, 11)),
-            Ok(cand("/in/b.jpg", "x", 5, 12)),
-        ];
-        let acts = resolve(staged, &DestIndex::default(), &h, false);
+        let mut w = World::default();
+        w.content(11, 1);
+        w.content(12, 1);
+        let acts = w.resolve(
+            vec![cand("/in/a.jpg", "x", 5, 11), cand("/in/b.jpg", "x", 5, 12)],
+            DupPolicy::Skip,
+        );
         assert_eq!(dst(&acts[0]), format!("{OUT}/x.jpg"));
-        match &acts[1] {
-            Action::Duplicate {
-                of,
-                depends_on,
-                delete,
-                ..
-            } => {
-                assert_eq!(of, &PathBuf::from(format!("{OUT}/x.jpg")));
-                assert_eq!(*depends_on, Some(0));
-                assert!(!*delete);
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn same_inode_is_in_place_or_undeletable_dup() {
-        let mut index = DestIndex::default();
-        index.insert(Path::new(OUT), OsStr::new("x.jpg"), info(5, 11));
-        let acts = resolve(
-            vec![Ok(cand("/in/a.jpg", "x", 5, 11))],
-            &index,
-            &HashMap::new(),
-            true,
-        );
         assert_eq!(
-            acts[0],
-            Action::AlreadyInPlace {
-                src: "/in/a.jpg".into()
-            }
-        );
-
-        // Two hard links to one inode in the input: never delete.
-        let staged = vec![
-            Ok(cand("/in/a.jpg", "x", 5, 11)),
-            Ok(cand("/in/b.jpg", "x", 5, 11)),
-        ];
-        let acts = resolve(staged, &DestIndex::default(), &HashMap::new(), true);
-        assert!(
-            matches!(acts[1], Action::Duplicate { delete: false, .. }),
-            "{:?}",
-            acts[1]
+            dup(&acts[1]),
+            (format!("{OUT}/x.jpg"), Some(0), DupHandling::Report)
         );
     }
 
     #[test]
-    fn symlinked_existing_is_not_a_duplicate_copy() {
-        let mut index = DestIndex::default();
+    fn same_inode_is_in_place() {
+        let mut w = World::default();
+        w.file(OUT, "x.jpg", 5, 11, None);
+        let acts = w.resolve(vec![cand("/in/a.jpg", "x", 5, 11)], DupPolicy::Delete);
+        assert!(in_place(&acts[0]), "{acts:?}");
+    }
+
+    /// U10.
+    #[test]
+    fn hardlinked_inputs_are_duplicates_never_deleted() {
+        let acts = World::default().resolve(
+            vec![cand("/in/a.jpg", "x", 5, 11), cand("/in/b.jpg", "x", 5, 11)],
+            DupPolicy::Delete,
+        );
+        assert_eq!(dst(&acts[0]), format!("{OUT}/x.jpg"));
+        assert_eq!(
+            dup(&acts[1]),
+            (format!("{OUT}/x.jpg"), Some(0), DupHandling::KeepSameFile)
+        );
+    }
+
+    /// U12.
+    #[test]
+    fn out_symlink_is_never_a_content_keeper() {
+        let mut w = World::default();
         let link = Some(FileInfo {
             size: 5,
             dev_ino: (1, 99),
             symlink: true,
         });
-        index.insert(Path::new(OUT), OsStr::new("x.jpg"), link);
-        let h = hashes(&[(&format!("{OUT}/x.jpg"), 7), ("/in/a.jpg", 7)]);
-        let acts = resolve(vec![Ok(cand("/in/a.jpg", "x", 5, 11))], &index, &h, true);
+        w.dest.insert(Path::new(OUT), OsStr::new("x.jpg"), link);
+        w.out.insert_link(format!("{OUT}/x.jpg"), (1, 99));
+        w.out.insert_link("/out/other/y.jpg", (1, 99));
+        w.content(99, 7);
+        w.content(11, 7);
+        let acts = w.resolve(vec![cand("/in/a.jpg", "x", 5, 11)], DupPolicy::Delete);
         assert_eq!(dst(&acts[0]), format!("{OUT}/x-2.jpg"));
     }
 
     #[test]
     fn sidecar_name_collision_bumps_the_bundle() {
-        let mut index = DestIndex::default();
-        index.insert(Path::new(OUT), OsStr::new("x.xmp"), None);
-        let mut c = cand("/in/a.jpg", "x", 5, 11);
-        c.sidecars.push(Sidecar {
-            path: "/in/a.xmp".into(),
-            form: SidecarForm::StemOnly,
-        });
-        let acts = resolve(vec![Ok(c)], &index, &HashMap::new(), false);
+        let mut w = World::default();
+        w.occupied(OUT, "x.xmp");
+        let c = with_sidecars(cand("/in/a.jpg", "x", 5, 11), &[SidecarForm::StemOnly]);
+        let acts = w.resolve(vec![c], DupPolicy::Skip);
         match &acts[0] {
             Action::Transfer { dst, sidecars, .. } => {
                 assert_eq!(dst, &PathBuf::from(format!("{OUT}/x-2.jpg")));
@@ -940,10 +1042,10 @@ mod tests {
         // 12,000 > the old 9,999 cap. Correctness only, no wall-clock
         // check: a timing assert would be flaky on a loaded CI box.
         const N: u64 = 12_000;
-        let staged = (0..N)
-            .map(|i| Ok(cand(&format!("/in/{i}.jpg"), "x", i, i)))
+        let cands = (0..N)
+            .map(|i| cand(&format!("/in/{i}.jpg"), "x", i + 1, i))
             .collect();
-        let acts = resolve(staged, &DestIndex::default(), &HashMap::new(), false);
+        let acts = World::default().resolve(cands, DupPolicy::Skip);
         assert_eq!(dst(&acts[0]), format!("{OUT}/x.jpg"));
         assert_eq!(dst(&acts[N as usize - 1]), format!("{OUT}/x-{N}.jpg"));
         let unique: HashSet<String> = acts.iter().map(dst).collect();
@@ -953,87 +1055,322 @@ mod tests {
     #[test]
     fn duplicate_found_deep_in_a_long_chain() {
         // Existing x.jpg … x-500.jpg; the input equals x-300.jpg.
-        let mut index = DestIndex::default();
-        for n in 1..=500 {
+        let mut w = World::default();
+        for n in 1..=500u32 {
             let name = numbered_name(OsStr::new("x"), Some(OsStr::new("jpg")), n);
-            index.insert(
-                Path::new(OUT),
-                &name,
-                info(u64::from(n), 1000 + u64::from(n)),
+            let content = (n == 300).then_some(3);
+            w.file(
+                OUT,
+                &name.to_string_lossy(),
+                u64::from(n),
+                1000 + u64::from(n),
+                content,
             );
         }
-        let h = hashes(&[(&format!("{OUT}/x-300.jpg"), 3), ("/in/a.jpg", 3)]);
-        let acts = resolve(vec![Ok(cand("/in/a.jpg", "x", 300, 11))], &index, &h, true);
-        assert!(
-            matches!(&acts[0], Action::Duplicate { of, .. } if of == &PathBuf::from(format!("{OUT}/x-300.jpg"))),
-            "{:?}",
-            acts[0]
-        );
+        w.content(11, 3);
+        let acts = w.resolve(vec![cand("/in/a.jpg", "x", 300, 11)], DupPolicy::Delete);
+        assert_eq!(dup(&acts[0]).0, format!("{OUT}/x-300.jpg"));
         // A different file still gets the first free number.
-        let acts = resolve(
-            vec![Ok(cand("/in/b.jpg", "x", 7, 12))],
-            &index,
-            &HashMap::new(),
-            false,
-        );
+        let acts = w.resolve(vec![cand("/in/b.jpg", "x", 7, 12)], DupPolicy::Skip);
         assert_eq!(dst(&acts[0]), format!("{OUT}/x-501.jpg"));
-    }
-
-    #[test]
-    fn match_above_the_first_free_slot_is_ignored() {
-        // x.jpg differs, x-2 is free, x-3.jpg is identical: the walk stops
-        // at the free x-2 before it ever sees x-3, so this is a transfer.
-        let mut index = DestIndex::default();
-        index.insert(Path::new(OUT), OsStr::new("x.jpg"), info(9, 90));
-        index.insert(Path::new(OUT), OsStr::new("x-3.jpg"), info(5, 93));
-        let h = hashes(&[(&format!("{OUT}/x-3.jpg"), 3), ("/in/a.jpg", 3)]);
-        let acts = resolve(vec![Ok(cand("/in/a.jpg", "x", 5, 11))], &index, &h, true);
-        assert_eq!(dst(&acts[0]), format!("{OUT}/x-2.jpg"));
     }
 
     #[test]
     fn match_still_found_when_a_sidecar_name_is_taken() {
         // x.xmp blocks x as a free slot for the bundle, but x.jpg is
         // identical to the input, so the input is its duplicate.
-        let mut index = DestIndex::default();
-        index.insert(Path::new(OUT), OsStr::new("x.xmp"), None);
-        index.insert(Path::new(OUT), OsStr::new("x.jpg"), info(5, 90));
-        let h = hashes(&[(&format!("{OUT}/x.jpg"), 3), ("/in/a.jpg", 3)]);
-        let mut c = cand("/in/a.jpg", "x", 5, 11);
-        c.sidecars.push(Sidecar {
-            path: "/in/a.xmp".into(),
-            form: SidecarForm::StemOnly,
-        });
-        let acts = resolve(vec![Ok(c)], &index, &h, true);
-        assert!(
-            matches!(&acts[0], Action::Duplicate { of, .. } if of == &PathBuf::from(format!("{OUT}/x.jpg"))),
-            "{:?}",
-            acts[0]
-        );
+        let mut w = World::default();
+        w.occupied(OUT, "x.xmp");
+        w.file(OUT, "x.jpg", 5, 90, Some(3));
+        w.content(11, 3);
+        let c = with_sidecars(cand("/in/a.jpg", "x", 5, 11), &[SidecarForm::StemOnly]);
+        let acts = w.resolve(vec![c], DupPolicy::Delete);
+        assert_eq!(dup(&acts[0]).0, format!("{OUT}/x.jpg"));
     }
 
     #[test]
     fn other_stem_holding_a_numbered_name_is_found() {
         // "x-2" (a kept original name) lands on x's position 2.
-        let h = hashes(&[("/in/a.jpg", 1), ("/in/b.jpg", 1)]);
-        let staged = vec![
-            Ok(cand("/in/o.jpg", "x", 9, 10)),
-            Ok(cand("/in/a.jpg", "x-2", 5, 11)),
-            Ok(cand("/in/b.jpg", "x", 5, 12)),
-        ];
-        let acts = resolve(staged, &DestIndex::default(), &h, false);
-        assert_eq!(dst(&acts[1]), format!("{OUT}/x-2.jpg"));
-        assert!(
-            matches!(
-                acts[2],
-                Action::Duplicate {
-                    depends_on: Some(1),
-                    ..
-                }
-            ),
-            "{:?}",
-            acts[2]
+        let mut w = World::default();
+        w.content(11, 1);
+        w.content(12, 1);
+        let acts = w.resolve(
+            vec![
+                cand("/in/o.jpg", "x", 9, 10),
+                cand("/in/a.jpg", "x-2", 5, 11),
+                cand("/in/b.jpg", "x", 5, 12),
+            ],
+            DupPolicy::Skip,
         );
+        assert_eq!(dst(&acts[1]), format!("{OUT}/x-2.jpg"));
+        assert_eq!(dup(&acts[2]).1, Some(1));
+    }
+
+    /// U1: the exact F1 shape. Existing different `T.jpg` and a stale
+    /// `T-2.jpg.xmp`: a (with both sidecars) can't use `-2`, so it takes
+    /// `-3`; its sidecar-less twin b must not land in the `-2` gap.
+    #[test]
+    fn f1_planned_twin_above_a_sidecar_gap_is_a_duplicate() {
+        let mut w = World::default();
+        w.file(OUT, "T.jpg", 5, 90, Some(9));
+        w.occupied(OUT, "T-2.jpg.xmp");
+        w.content(11, 1);
+        w.content(12, 1);
+        let a = with_sidecars(
+            cand("/in/dto.jpg", "T", 5, 11),
+            &[SidecarForm::WithExt, SidecarForm::StemOnly],
+        );
+        let b = cand("/in/sub/dto_copy.jpg", "T", 5, 12);
+        let acts = w.resolve(vec![a, b], DupPolicy::Skip);
+        match &acts[0] {
+            Action::Transfer { dst, sidecars, .. } => {
+                assert_eq!(dst, &PathBuf::from(format!("{OUT}/T-3.jpg")));
+                let side: Vec<String> = sidecars
+                    .iter()
+                    .map(|s| s.dst.display().to_string())
+                    .collect();
+                assert_eq!(
+                    side,
+                    [format!("{OUT}/T-3.jpg.xmp"), format!("{OUT}/T-3.xmp")]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            dup(&acts[1]),
+            (format!("{OUT}/T-3.jpg"), Some(0), DupHandling::Report)
+        );
+    }
+
+    /// U2: a single stale sidecar name is enough to open the gap.
+    #[test]
+    fn f1_minimal_stale_sidecar_gap() {
+        let mut w = World::default();
+        w.occupied(OUT, "T.jpg.xmp");
+        w.content(11, 1);
+        w.content(12, 1);
+        let a = with_sidecars(cand("/in/a.jpg", "T", 5, 11), &[SidecarForm::WithExt]);
+        let b = cand("/in/b.jpg", "T", 5, 12);
+        let acts = w.resolve(vec![a, b], DupPolicy::Skip);
+        assert_eq!(dst(&acts[0]), format!("{OUT}/T-2.jpg"));
+        assert_eq!(dup(&acts[1]).0, format!("{OUT}/T-2.jpg"));
+    }
+
+    /// U3: reverse order. The sidecar-less twin comes first and takes the
+    /// lowest free slot; the other one is its duplicate and, report-only,
+    /// leaves its sidecars in place.
+    #[test]
+    fn twin_without_sidecars_first_takes_the_slot() {
+        let mut w = World::default();
+        w.file(OUT, "T.jpg", 5, 90, Some(9));
+        w.occupied(OUT, "T-2.jpg.xmp");
+        w.content(11, 1);
+        w.content(12, 1);
+        let b = cand("/in/a/copy.jpg", "T", 5, 12);
+        let a = with_sidecars(cand("/in/b/dto.jpg", "T", 5, 11), &[SidecarForm::WithExt]);
+        let acts = w.resolve(vec![b, a], DupPolicy::Skip);
+        assert_eq!(dst(&acts[0]), format!("{OUT}/T-2.jpg"));
+        assert_eq!(
+            dup(&acts[1]),
+            (format!("{OUT}/T-2.jpg"), Some(0), DupHandling::Report)
+        );
+        match &acts[1] {
+            Action::Duplicate { sidecars_left, .. } => {
+                assert_eq!(sidecars_left, &[PathBuf::from("/in/b/dto.jpg.xmp")]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// U4 (rev 1's V3; replaces `match_above_the_first_free_slot_is_ignored`).
+    #[test]
+    fn existing_twin_above_a_gap_is_a_duplicate() {
+        let mut w = World::default();
+        w.file(OUT, "x.jpg", 9, 90, Some(1));
+        w.file(OUT, "x-3.jpg", 5, 93, Some(3));
+        w.content(11, 3);
+        let acts = w.resolve(vec![cand("/in/a.jpg", "x", 5, 11)], DupPolicy::Delete);
+        assert_eq!(
+            dup(&acts[0]),
+            (format!("{OUT}/x-3.jpg"), None, DupHandling::Delete)
+        );
+    }
+
+    /// U5 (rev 1's V4): organizing in place, the OUT walk is empty, and a
+    /// file at `x-3.jpg` stays there although `x-2.jpg` is free.
+    #[test]
+    fn inode_match_above_a_gap_is_in_place() {
+        let mut w = World::default();
+        w.dest
+            .insert(Path::new(OUT), OsStr::new("x.jpg"), info(9, 90));
+        w.dest
+            .insert(Path::new(OUT), OsStr::new("x-3.jpg"), info(5, 11));
+        let acts = w.resolve(
+            vec![cand(&format!("{OUT}/x-3.jpg"), "x", 5, 11)],
+            DupPolicy::Skip,
+        );
+        assert!(in_place(&acts[0]), "{acts:?}");
+    }
+
+    /// U6.
+    #[test]
+    fn different_content_still_takes_lowest_free_slot() {
+        let mut w = World::default();
+        w.file(OUT, "x.jpg", 5, 90, Some(1));
+        w.file(OUT, "x-3.jpg", 5, 93, Some(3));
+        w.content(11, 4);
+        let acts = w.resolve(vec![cand("/in/a.jpg", "x", 5, 11)], DupPolicy::Skip);
+        assert_eq!(dst(&acts[0]), format!("{OUT}/x-2.jpg"));
+    }
+
+    /// U7: global, so neither the date nor the name matters.
+    #[test]
+    fn identical_content_with_another_date_or_name_is_a_duplicate() {
+        let mut w = World::default();
+        w.content(11, 1);
+        w.content(12, 1);
+        let a = cand("/in/IMG_20160915_123456.jpg", "20160915-123456", 5, 11);
+        let mut b = cand("/in/plain.jpg", "plain", 5, 12);
+        b.target.dir = PathBuf::from("/out/unknown");
+        b.target.generated = false;
+        let acts = w.resolve(vec![a, b], DupPolicy::Skip);
+        assert_eq!(dst(&acts[0]), format!("{OUT}/20160915-123456.jpg"));
+        assert_eq!(
+            dup(&acts[1]),
+            (
+                format!("{OUT}/20160915-123456.jpg"),
+                Some(0),
+                DupHandling::Report
+            )
+        );
+    }
+
+    /// U8.
+    #[test]
+    fn identical_existing_file_anywhere_in_out_is_the_keeper() {
+        let mut w = World::default();
+        w.file("/out/elsewhere", "old name.png", 5, 50, Some(3));
+        w.content(11, 3);
+        let acts = w.resolve(vec![cand("/in/a.jpg", "x", 5, 11)], DupPolicy::Skip);
+        assert_eq!(
+            dup(&acts[0]),
+            (
+                "/out/elsewhere/old name.png".into(),
+                None,
+                DupHandling::Report
+            )
+        );
+    }
+
+    /// U9.
+    #[test]
+    fn keeper_precedence() {
+        // Existing beats in place: the input whose chain holds it is still
+        // a duplicate of the existing file elsewhere in OUT.
+        let mut w = World::default();
+        w.dest
+            .insert(Path::new(OUT), OsStr::new("x-2.jpg"), info(5, 11));
+        w.file("/out/z", "k.jpg", 5, 50, Some(3));
+        w.content(11, 3);
+        w.content(12, 3);
+        let acts = w.resolve(
+            vec![cand("/in/a.jpg", "x", 5, 11), cand("/in/b.jpg", "x", 5, 12)],
+            DupPolicy::Skip,
+        );
+        assert_eq!(dup(&acts[0]).0, "/out/z/k.jpg");
+        assert_eq!(dup(&acts[1]).0, "/out/z/k.jpg");
+
+        // In place beats the first input: b is in place, a (earlier in
+        // input order) is its duplicate.
+        let mut w = World::default();
+        w.dest
+            .insert(Path::new(OUT), OsStr::new("x-2.jpg"), info(5, 12));
+        w.content(11, 3);
+        w.content(12, 3);
+        let acts = w.resolve(
+            vec![
+                cand("/in/a.jpg", "x", 5, 11),
+                cand(&format!("{OUT}/x-2.jpg"), "x", 5, 12),
+            ],
+            DupPolicy::Skip,
+        );
+        assert_eq!(
+            dup(&acts[0]),
+            (format!("{OUT}/x-2.jpg"), None, DupHandling::Report)
+        );
+        assert!(in_place(&acts[1]), "{acts:?}");
+
+        // Among in-place twins, the holder order decides, not input order:
+        // the file at x.jpg stays, the one at x-2.jpg is its duplicate.
+        let mut w = World::default();
+        w.dest
+            .insert(Path::new(OUT), OsStr::new("x-2.jpg"), info(5, 11));
+        w.dest
+            .insert(Path::new(OUT), OsStr::new("x.jpg"), info(5, 12));
+        w.content(11, 3);
+        w.content(12, 3);
+        let acts = w.resolve(
+            vec![
+                cand(&format!("{OUT}/x-2.jpg"), "x", 5, 11),
+                cand(&format!("{OUT}/x.jpg"), "x", 5, 12),
+            ],
+            DupPolicy::Skip,
+        );
+        assert_eq!(dup(&acts[0]).0, format!("{OUT}/x.jpg"));
+        assert!(in_place(&acts[1]), "{acts:?}");
+
+        // The base name beats -2 (path order alone would pick x-2.jpg).
+        let mut w = World::default();
+        w.file(OUT, "x-2.jpg", 5, 60, Some(3));
+        w.file(OUT, "x.jpg", 5, 61, Some(3));
+        w.content(11, 3);
+        let acts = w.resolve(vec![cand("/in/a.jpg", "q", 5, 11)], DupPolicy::Skip);
+        assert_eq!(dup(&acts[0]).0, format!("{OUT}/x.jpg"));
+
+        // Ties are broken by folder.
+        let mut w = World::default();
+        w.file("/out/b", "x.jpg", 5, 70, Some(3));
+        w.file("/out/a", "x.jpg", 5, 71, Some(3));
+        w.content(11, 3);
+        let acts = w.resolve(vec![cand("/in/a.jpg", "q", 5, 11)], DupPolicy::Skip);
+        assert_eq!(dup(&acts[0]).0, "/out/a/x.jpg");
+    }
+
+    /// U11 (decision A1-Q2 = A): same inode as any OUT file, regular or
+    /// symlink, is in place, even with `--delete-duplicates`.
+    #[test]
+    fn same_inode_as_output_is_in_place() {
+        let mut w = World::default();
+        w.file("/out/other", "foo.jpg", 5, 11, Some(3));
+        w.out.insert_link("/out/links/bar.jpg", (1, 12));
+        w.content(11, 3);
+        let acts = w.resolve(
+            vec![cand("/in/a.jpg", "x", 5, 11), cand("/in/b.jpg", "x", 6, 12)],
+            DupPolicy::Delete,
+        );
+        assert!(in_place(&acts[0]) && in_place(&acts[1]), "{acts:?}");
+    }
+
+    /// U13.
+    #[test]
+    fn empty_files_are_never_duplicates() {
+        let mut w = World::default();
+        w.file(OUT, "x.jpg", 0, 90, None);
+        let acts = w.resolve(
+            vec![cand("/in/a.jpg", "x", 0, 11), cand("/in/b.jpg", "x", 0, 12)],
+            DupPolicy::Delete,
+        );
+        assert_eq!(dst(&acts[0]), format!("{OUT}/x-2.jpg"));
+        assert_eq!(dst(&acts[1]), format!("{OUT}/x-3.jpg"));
+    }
+
+    /// U14: no hash (the read failed) means no duplicate.
+    #[test]
+    fn unreadable_file_is_never_a_duplicate() {
+        let mut w = World::default();
+        w.file(OUT, "x.jpg", 5, 90, Some(3));
+        let acts = w.resolve(vec![cand("/in/a.jpg", "x", 5, 11)], DupPolicy::Delete);
+        assert_eq!(dst(&acts[0]), format!("{OUT}/x-2.jpg"));
     }
 
     fn dir(path: &str, depth: usize, children: usize, junk: &[&str]) -> DirInfo {
@@ -1060,22 +1397,33 @@ mod tests {
     #[test]
     fn rmdirs_simulation() {
         let dirs = [
-            dir("/in", 0, 3, &[]),
+            dir("/in", 0, 4, &[]),
             dir("/in/a", 1, 2, &["/in/a/.DS_Store"]), // a.jpg + junk
             dir("/in/b", 1, 2, &[]),                  // b.jpg + keep.txt
             dir("/in/c", 1, 1, &[]),                  // c/d
             dir("/in/c/d", 2, 1, &[]),                // d.jpg
+            dir("/in/e", 1, 1, &[]),                  // deleted duplicate
         ];
+        let deleted = Action::Duplicate {
+            src: "/in/e/dup.jpg".into(),
+            of: "/out/x/1.jpg".into(),
+            handling: DupHandling::Delete,
+            depends_on: Some(0),
+            size: 1,
+            dev_ino: (1, 1),
+            sidecars_left: vec![],
+        };
         let actions = [
             moved("/in/a/a.jpg", "/out/x/1.jpg"),
             moved("/in/b/b.jpg", "/out/x/2.jpg"),
             moved("/in/c/d/d.jpg", "/out/x/3.jpg"),
+            deleted,
         ];
         let got: Vec<String> = plan_rmdirs(&dirs, &actions, Path::new("/in"))
             .iter()
             .map(|r| r.path.display().to_string())
             .collect();
-        assert_eq!(got, ["/in/c/d", "/in/a", "/in/c"]);
+        assert_eq!(got, ["/in/c/d", "/in/a", "/in/c", "/in/e"]);
     }
 
     #[test]
@@ -1094,20 +1442,405 @@ mod tests {
         assert_eq!(chain_keys(Path::new("/d"), Path::new("a-b.jpg")).len(), 1);
     }
 
-    #[test]
-    fn hash_set_only_size_collisions() {
-        let mut index = DestIndex::default();
-        index.insert(Path::new(OUT), OsStr::new("x.jpg"), info(5, 99));
-        index.insert(Path::new(OUT), OsStr::new("x-2.jpg"), info(6, 98));
-        let a = cand("/in/a.jpg", "x", 5, 11);
-        let b = cand("/in/b.jpg", "x", 7, 12);
-        let set = hash_set(&[&a, &b], &index);
-        assert_eq!(
-            set,
-            [
-                PathBuf::from("/in/a.jpg"),
-                PathBuf::from(format!("{OUT}/x.jpg"))
-            ]
+    // ---- U17 / U18: seeded differential test against a brute-force
+    // reference that knows nothing about chains, classes or hashes.
+
+    /// SplitMix64: a tiny deterministic generator (no extra dependency).
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+            &items[self.below(items.len() as u64) as usize]
+        }
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+    }
+
+    /// Content id → size. 0 is empty; 3–6 are "large" (two-stage hash),
+    /// with 4 and 5 sharing a partial hash so stage 2 has to tell them apart.
+    const SIZES: [u64; 7] = [0, 5, 5, 200_000, 200_000, 200_000, 200_000];
+    const D: &str = OUT;
+    const E: &str = "/out/other";
+
+    #[derive(Debug, Clone, Copy)]
+    struct Obj {
+        ino: u64,
+        cid: usize,
+        readable: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    struct Ex {
+        dir: &'static str,
+        name: String,
+        obj: Obj,
+        symlink: bool,
+        in_out: bool,
+    }
+
+    impl Ex {
+        fn path(&self) -> PathBuf {
+            Path::new(self.dir).join(&self.name)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct Case {
+        existing: Vec<Ex>,
+        cands: Vec<(Candidate, Obj)>,
+        policy: DupPolicy,
+    }
+
+    fn gen_case(seed: u64) -> Case {
+        let mut rng = Rng(seed);
+        let mut next_ino = 100;
+        let mut fresh = |rng: &mut Rng| {
+            next_ino += 1;
+            Obj {
+                ino: next_ino,
+                cid: rng.below(7) as usize,
+                readable: !rng.chance(10),
+            }
+        };
+        // In-place runs: INPUT == OUT, so the OUT walk is empty and the
+        // existing names are only seen through the target folders.
+        let in_out = !rng.chance(25);
+        let mut cands: Vec<(Candidate, Obj)> = Vec::new();
+        for i in 0..1 + rng.below(6) {
+            let obj = if !cands.is_empty() && rng.chance(15) {
+                rng.pick(&cands).1 // hard link to an earlier input
+            } else if !cands.is_empty() && rng.chance(30) {
+                // Same content as an earlier input, another inode.
+                let twin = rng.pick(&cands).1;
+                Obj {
+                    ino: fresh(&mut rng).ino,
+                    ..twin
+                }
+            } else {
+                fresh(&mut rng)
+            };
+            let stem = *rng.pick(&["x", "X", "x-2", "y"]);
+            let ext = *rng.pick(&[Some("jpg"), Some("JPG"), None]);
+            let mut forms = Vec::new();
+            if rng.chance(30) {
+                forms.push(SidecarForm::WithExt);
+            }
+            if rng.chance(30) {
+                forms.push(SidecarForm::StemOnly);
+            }
+            let mut c = with_sidecars(
+                cand(&format!("/in/{i}.jpg"), stem, SIZES[obj.cid], obj.ino),
+                &forms,
+            );
+            c.dev_ino = (1, obj.ino);
+            c.target.ext = ext.map(OsString::from);
+            c.target.generated = rng.chance(50);
+            if rng.chance(20) {
+                c.target.dir = PathBuf::from(E);
+            }
+            cands.push((c, obj));
+        }
+        let names = [
+            "x.jpg",
+            "X.JPG",
+            "x-2.jpg",
+            "x-3.jpg",
+            "x-2-2.jpg",
+            "x",
+            "x-2",
+            "x.jpg.xmp",
+            "x-2.jpg.xmp",
+            "x.xmp",
+            "x-2.xmp",
+            "y.jpg",
+            "x-02.jpg",
+            "q.png",
+        ];
+        let mut existing: Vec<Ex> = Vec::new();
+        for _ in 0..rng.below(9) {
+            let dir = if rng.chance(75) { D } else { E };
+            let name = (*rng.pick(&names)).to_owned();
+            if existing
+                .iter()
+                .any(|e| e.dir == dir && e.name.to_lowercase() == name.to_lowercase())
+            {
+                continue;
+            }
+            let obj = if rng.chance(40) {
+                rng.pick(&cands).1 // hard link (or symlink target) to an input
+            } else {
+                fresh(&mut rng)
+            };
+            existing.push(Ex {
+                dir,
+                name,
+                obj,
+                symlink: rng.chance(15),
+                in_out,
+            });
+        }
+        let policy = if rng.chance(50) {
+            DupPolicy::Skip
+        } else {
+            DupPolicy::Delete
+        };
+        Case {
+            existing,
+            cands,
+            policy,
+        }
+    }
+
+    /// Builds the plan's inputs, hashing through the real size grouping and
+    /// two-stage driver with fake readers. `reverse` inserts everything in
+    /// the opposite order (U18).
+    fn run_case(case: &Case, pool: &rayon::ThreadPool, reverse: bool) -> Vec<Action> {
+        let mut existing = case.existing.clone();
+        if reverse {
+            existing.reverse();
+        }
+        let mut w = World::default();
+        let mut objs: HashMap<u64, Obj> = HashMap::new();
+        for e in &existing {
+            objs.insert(e.obj.ino, e.obj);
+            let fi = FileInfo {
+                size: SIZES[e.obj.cid],
+                dev_ino: (1, e.obj.ino),
+                symlink: e.symlink,
+            };
+            w.dest
+                .insert(Path::new(e.dir), OsStr::new(&e.name), Some(fi));
+            if e.in_out && e.symlink {
+                w.out.insert_link(e.path(), (1, e.obj.ino));
+            } else if e.in_out {
+                w.out
+                    .insert_file(e.path(), SIZES[e.obj.cid], (1, e.obj.ino));
+            }
+        }
+        for (_, o) in &case.cands {
+            objs.insert(o.ino, *o);
+        }
+        let mut members: Vec<Member<'_>> = case
+            .cands
+            .iter()
+            .map(|(c, _)| Member {
+                path: &c.src,
+                size: c.size,
+                dev_ino: c.dev_ino,
+                candidate: true,
+            })
+            .collect();
+        members.extend(w.out.files().iter().map(|f| Member {
+            path: &f.path,
+            size: f.size,
+            dev_ino: f.dev_ino,
+            candidate: false,
+        }));
+        let read = |r: &Rep, partial: bool| {
+            let o = objs[&r.dev_ino.1];
+            let tag = if partial { o.cid / 2 } else { o.cid };
+            o.readable
+                .then(|| blake3::hash(&[tag as u8, partial as u8]))
+        };
+        let (hashes, _) = hash::two_stage(
+            dedupe::size_groups(&members),
+            |r, _| read(r, true),
+            |r, _| read(r, false),
+            pool,
+            &Stop::new(),
         );
+        w.hashes = hashes;
+        let cands = case.cands.iter().map(|(c, _)| c.clone()).collect();
+        w.resolve(cands, case.policy)
+    }
+
+    /// The rules of amendment A1, stated directly: pairwise comparison, a
+    /// linear search for names.
+    fn reference(case: &Case) -> Vec<Action> {
+        let same = |a: &Obj, b: &Obj| {
+            a.ino == b.ino || (a.readable && b.readable && a.cid == b.cid && SIZES[a.cid] > 0)
+        };
+        let folded = |s: &OsStr| s.to_string_lossy().to_lowercase();
+        // The existing path in c's own chain holding c's inode, lowest n.
+        let chain_holder = |c: &Candidate, o: &Obj| -> Option<PathBuf> {
+            (1..=60u32).find_map(|n| {
+                let name = folded(&numbered_name(&c.target.stem, c.target.ext.as_deref(), n));
+                case.existing
+                    .iter()
+                    .filter(|e| Path::new(e.dir) == c.target.dir && e.obj.ino == o.ino)
+                    .filter(|e| e.name.to_lowercase() == name)
+                    .map(Ex::path)
+                    .min()
+            })
+        };
+        let out_holder = |o: &Obj| -> Option<PathBuf> {
+            case.existing
+                .iter()
+                .filter(|e| e.in_out && e.obj.ino == o.ino)
+                .map(Ex::path)
+                .min()
+        };
+        let handling = |c: &Obj, keeper: u64| match case.policy {
+            DupPolicy::Skip => DupHandling::Report,
+            DupPolicy::Delete if c.ino == keeper => DupHandling::KeepSameFile,
+            DupPolicy::Delete => DupHandling::Delete,
+        };
+        let mut planned: Vec<(PathBuf, String)> = Vec::new();
+        let mut out: Vec<Action> = Vec::new();
+        for (i, (c, o)) in case.cands.iter().enumerate() {
+            let dup = |of: PathBuf, keeper: u64, depends_on| Action::Duplicate {
+                src: c.src.clone(),
+                of,
+                handling: handling(o, keeper),
+                depends_on,
+                size: c.size,
+                dev_ino: c.dev_ino,
+                sidecars_left: c.sidecars.iter().map(|s| s.path.clone()).collect(),
+            };
+            let in_place = Action::AlreadyInPlace { src: c.src.clone() };
+            if out_holder(o).is_some() {
+                out.push(in_place);
+                continue;
+            }
+            let nonempty = SIZES[o.cid] > 0;
+            if !nonempty && chain_holder(c, o).is_some() {
+                out.push(in_place);
+                continue;
+            }
+            if nonempty {
+                // Rule 1.
+                let existing = case
+                    .existing
+                    .iter()
+                    .filter(|e| e.in_out && !e.symlink && same(&e.obj, o))
+                    .min_by_key(|e| dedupe::order_key(&e.path()));
+                if let Some(e) = existing {
+                    out.push(dup(e.path(), e.obj.ino, None));
+                    continue;
+                }
+                // Rule 2.
+                let in_place_keeper = case
+                    .cands
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, oj))| same(oj, o))
+                    .filter_map(|(j, (cj, oj))| {
+                        let h = out_holder(oj).or_else(|| chain_holder(cj, oj))?;
+                        Some(((dedupe::order_key(&h), cj.src != h, j), j))
+                    })
+                    .min();
+                if let Some((_, j)) = in_place_keeper {
+                    let (cj, oj) = &case.cands[j];
+                    out.push(if j == i {
+                        in_place
+                    } else {
+                        dup(cj.src.clone(), oj.ino, None)
+                    });
+                    continue;
+                }
+                // Rule 3.
+                let first = (0..i).find(|&j| {
+                    same(&case.cands[j].1, o) && matches!(out[j], Action::Transfer { .. })
+                });
+                if let Some(j) = first {
+                    let Action::Transfer { dst, .. } = &out[j] else {
+                        unreachable!()
+                    };
+                    out.push(dup(dst.clone(), case.cands[j].1.ino, Some(j)));
+                    continue;
+                }
+            }
+            // Naming: the lowest n whose whole bundle is free.
+            let t = &c.target;
+            let taken = |name: &OsStr, planned: &[(PathBuf, String)]| {
+                let f = folded(name);
+                case.existing
+                    .iter()
+                    .any(|e| Path::new(e.dir) == t.dir && e.name.to_lowercase() == f)
+                    || planned.iter().any(|(d, n)| *d == t.dir && *n == f)
+            };
+            let (name, sides) = (1..)
+                .find_map(|n| {
+                    let name = numbered_name(&t.stem, t.ext.as_deref(), n);
+                    let stem_n = numbered_name(&t.stem, None, n);
+                    let sides: Vec<OsString> = c
+                        .sidecars
+                        .iter()
+                        .map(|s| sidecar_name(&name, &stem_n, s, t.generated))
+                        .collect();
+                    let free = !taken(&name, &planned) && !sides.iter().any(|s| taken(s, &planned));
+                    free.then_some((name, sides))
+                })
+                .unwrap();
+            planned.push((t.dir.clone(), folded(&name)));
+            planned.extend(sides.iter().map(|s| (t.dir.clone(), folded(s))));
+            out.push(Action::Transfer {
+                src: c.src.clone(),
+                dst: t.dir.join(&name),
+                kind: c.kind,
+                dated: c.dated,
+                size: c.size,
+                sidecars: c
+                    .sidecars
+                    .iter()
+                    .zip(sides)
+                    .map(|(s, n)| PlannedSidecar {
+                        src: s.path.clone(),
+                        dst: t.dir.join(n),
+                    })
+                    .collect(),
+            });
+        }
+        out
+    }
+
+    fn one_thread() -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+    }
+
+    /// U17.
+    #[test]
+    fn resolver_matches_reference_rule() {
+        let pool = one_thread();
+        let mut dups = 0;
+        for seed in 0..3_000 {
+            let case = gen_case(seed);
+            let got = run_case(&case, &pool, false);
+            let want = reference(&case);
+            assert_eq!(got, want, "seed {seed}: {case:#?}");
+            dups += got
+                .iter()
+                .filter(|a| matches!(a, Action::Duplicate { .. }))
+                .count();
+        }
+        assert!(dups > 500, "the generator must produce duplicates ({dups})");
+    }
+
+    /// U18.
+    #[test]
+    fn resolve_is_independent_of_index_insertion_order() {
+        let pool = one_thread();
+        for seed in 0..1_000 {
+            let case = gen_case(seed);
+            assert_eq!(
+                run_case(&case, &pool, false),
+                run_case(&case, &pool, true),
+                "seed {seed}"
+            );
+        }
     }
 }

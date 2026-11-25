@@ -91,7 +91,11 @@ fn sidecars_follow_their_media_with_collision_suffix() {
     env.write("A/first.arw", &first);
     env.add("fake.arw", "IMG_1.ARW");
     env.write("IMG_1.ARW.xmp", b"<xmp with ext/>");
-    env.add("a.tiff", "IMG_1.JPG");
+    // a.tiff is byte-identical to fake.arw; keep it distinct so this is
+    // two different files sharing IMG_1.xmp, not a duplicate.
+    let mut tiff = fs::read(fixture("a.tiff")).unwrap();
+    tiff.push(2);
+    env.write("IMG_1.JPG", &tiff);
     env.write("IMG_1.xmp", b"<shared stem/>");
     env.add("dto.jpg", "solo.jpg");
     env.write("solo.XMP", b"<stem only/>");

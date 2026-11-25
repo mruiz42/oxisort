@@ -16,6 +16,7 @@ pub mod classify;
 pub mod cli;
 pub mod date;
 pub mod dateformat;
+pub mod dedupe;
 pub mod exec;
 pub mod extract;
 pub mod fsops;
