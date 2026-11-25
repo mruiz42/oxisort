@@ -57,8 +57,8 @@ TIFF-structured samples; a parse failure always falls back, never crashes.
 | `--max-depth N` | `0` = only files directly in INPUT |
 | `--delete-duplicates` | With `--move`: delete a source that is a verified duplicate |
 | `--rmdirs` | With `--move`: remove source folders left empty (folders holding only `.DS_Store`, `Thumbs.db`, `desktop.ini`, `._*` count as empty; that junk is deleted and logged) |
-| `-j, --jobs N` | Threads for metadata reading and hashing (default: CPU count) |
-| `--io-jobs N` | Parallel file transfers (default 4) |
+| `-j, --jobs N` | Threads for metadata reading (default: CPU count) |
+| `--io-jobs N` | Parallel file transfers and duplicate hashing, i.e. full-file reads (default 4) |
 | `--progress`, `-q, --quiet`, `-v` | Progress bar / silence / more detail |
 | `--log FILE` | Append a timestamped log of every action and the summary |
 
@@ -90,8 +90,14 @@ sequential reads into seeks.
   `*.lrlibrary`, …) are never entered. The output folder (if inside the
   input) and the `--log` file are excluded. INPUT may equal OUTPUT (organize
   in place).
-- Known limits: a power cut mid-copy can leave a truncated file under its
-  final name (copy mode keeps the source; a re-run gives it `-2`). An Apple
+- Copies close their destination explicitly and fail (removing the partial
+  file) if `close` reports an error, which is where network filesystems
+  (SMB/NFS) surface delayed write errors.
+- Known limits: a crash or power cut mid-copy can leave a truncated file under
+  its final name, because copies write straight to the final name to keep
+  no-clobber atomic (accepted risk R2). The source is kept (in move mode it
+  is deleted only after a verified copy). A re-run gives the real file a `-2`
+  name and leaves the truncated one in place; delete it by hand. An Apple
   video date stored with offset exactly `+00:00` is indistinguishable from a
   UTC `mvhd` date and gets converted with the zone. Hostile files can make the
   metadata parser allocate up to 1 GiB per thread.
@@ -143,3 +149,13 @@ scripts/parity.sh                            # phockup vs oxisort on the fixture
 
 Platforms: macOS is the verified target. The Linux code paths are written but
 not yet run in CI; Windows doesn't build yet.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in oxisort by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
