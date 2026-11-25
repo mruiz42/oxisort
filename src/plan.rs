@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::Pools;
+use crate::exec::Stop;
 use crate::extract::{ExtractError, Extracted};
 use crate::hash;
 use crate::model::{Action, Config, Kind, Mode, PlannedSidecar, SkipReason};
@@ -216,6 +217,7 @@ pub fn build(
     dirs_scanned: &[DirInfo],
     cfg: &Config,
     pools: &Pools,
+    stop: &Stop,
 ) -> Plan {
     let staged: Vec<Result<Candidate, Action>> = items
         .into_iter()
@@ -243,7 +245,7 @@ pub fn build(
     // Hashing reads whole files, so it runs on the io pool: `--io-jobs`
     // bounds concurrent full reads and spinning disks or SD cards aren't
     // thrashed (listing and stat above are metadata-only).
-    let hashes = hash::hash_all(&hash_set(&cands, &index), &pools.io);
+    let hashes = hash::hash_all(&hash_set(&cands, &index), &pools.io, stop);
 
     let delete = cfg.delete_duplicates && cfg.mode == Mode::Move;
     let actions = resolve(staged, &index, &hashes, delete);

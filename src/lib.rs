@@ -75,9 +75,13 @@ impl Pools {
 
 /// Runs phases 1–4 (scan, extract, plan) without changing anything.
 ///
-/// `stop` is checked between phases, so a Ctrl-C during a long scan or
-/// extraction (slow SD card, 50k files) ends the run promptly: the result
-/// is then an empty plan, and the caller reports the interruption.
+/// `stop` is checked after the scan and before each file of extraction and
+/// of the duplicate-hash pass, so a Ctrl-C during a long extraction or
+/// hashing (slow SD card, 50k files, large videos) returns once the files
+/// in flight finish. The scan itself is not interruptible. Once stopped,
+/// the result is an empty plan (a partial extraction or hash map is never
+/// planned from), so nothing is changed and the caller reports the
+/// interruption (exit 130).
 pub fn plan_run(
     cfg: &Config,
     pools: &Pools,
@@ -113,15 +117,19 @@ pub fn plan_run(
         timestamp: cfg.timestamp,
         zone: cfg.zone,
     };
-    let extracted = extract_all(entries, &opts, &pools.cpu, &bar);
+    let extracted = extract_all(entries, &opts, &pools.cpu, stop, &bar);
     bar.finish_and_clear();
     if stopped_before(stop, "planning") {
         return (scanned, Plan::default());
     }
 
     let spinner = progress.spinner("planning");
-    let plan = plan::build(extracted, &scanned.dirs, cfg, pools);
+    let plan = plan::build(extracted, &scanned.dirs, cfg, pools, stop);
     spinner.finish_and_clear();
+    // A stop during hashing leaves an incomplete hash map; discard the plan.
+    if stopped_before(stop, "executing") {
+        return (scanned, Plan::default());
+    }
     (scanned, plan)
 }
 

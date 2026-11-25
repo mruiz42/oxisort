@@ -13,6 +13,7 @@ use rayon::prelude::*;
 
 use crate::classify::{self, HEADER_LEN};
 use crate::date::{ResolveOptions, resolve};
+use crate::exec::Stop;
 use crate::metadata::{self, RawMeta};
 use crate::model::{Captured, Kind};
 use crate::scan::ScanEntry;
@@ -37,16 +38,28 @@ pub struct ExtractError {
 }
 
 /// Extracts every entry on `pool`, preserving order.
+///
+/// `stop` is checked before each file: once it is set, the remaining files
+/// are not opened and come back as an [`ExtractError`] ("interrupted"), so a
+/// Ctrl-C during a long extraction returns within one file per worker. The
+/// caller discards such a result rather than planning from it.
 pub fn extract_all(
     entries: Vec<ScanEntry>,
     opts: &ResolveOptions<'_>,
     pool: &rayon::ThreadPool,
+    stop: &Stop,
     bar: &ProgressBar,
 ) -> Vec<Result<Extracted, ExtractError>> {
     pool.install(|| {
         entries
             .into_par_iter()
             .map_init(MediaParser::new, |parser, entry| {
+                if stop.reason().is_some() {
+                    return Err(ExtractError {
+                        entry,
+                        message: "interrupted".to_owned(),
+                    });
+                }
                 let r = extract_one(parser, entry, opts);
                 bar.inc(1);
                 r
@@ -112,4 +125,38 @@ fn read_header(file: &mut File) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(HEADER_LEN);
     file.take(HEADER_LEN as u64).read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stopped_extraction_opens_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("a.jpg");
+        std::fs::write(&path, b"not really a jpeg").unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let stop = Stop::new();
+        stop.request(crate::model::NotRun::Interrupted);
+        let regex = crate::date::FilenameRegex::default();
+        let opts = ResolveOptions {
+            date_fields: &[],
+            regex: &regex,
+            timestamp: false,
+            zone: crate::model::Zone::System,
+        };
+        let entry = ScanEntry {
+            path,
+            sidecars: vec![],
+        };
+        let got = extract_all(vec![entry], &opts, &pool, &stop, &ProgressBar::hidden());
+        assert!(
+            matches!(&got[..], [Err(e)] if e.message == "interrupted"),
+            "{got:?}"
+        );
+    }
 }
