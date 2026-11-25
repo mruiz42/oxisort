@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Sort photos and videos into date-based folders, fast (a Rust redesign inspired by phockup)"
-license = "MIT"
 publish = false
 
 [lib]
