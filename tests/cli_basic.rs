@@ -208,3 +208,60 @@ fn custom_regex_and_timestamp() {
         ]
     );
 }
+
+#[test]
+fn prefix_suffix_and_no_date_dir() {
+    let env = Env::new();
+    env.add("dto.jpg", "dto.jpg");
+    env.add("base.jpg", "Base Name.JPG");
+    let out = env.run(&[
+        "--prefix",
+        "photos/raw",
+        "--suffix",
+        "sel",
+        "--no-date-dir",
+        "undated/x",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        env.out_tree(),
+        [
+            "photos/raw/2017/01/02/sel/20170102-030405123.jpg",
+            // No-date files keep their name verbatim (not lowercased).
+            "photos/raw/undated/x/sel/Base Name.JPG",
+        ]
+    );
+}
+
+#[test]
+fn date_format_and_original_names() {
+    let env = Env::new();
+    env.add("dto.jpg", "IMG_0001.JPG");
+    let out = env.run(&["-d", "YYYY-MM Month/m DDD", "--original-names"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(env.out_tree(), ["2017-01 Month/Jan 002/IMG_0001.JPG"]);
+}
+
+#[test]
+fn generated_names_lowercase_the_extension() {
+    let env = Env::new();
+    env.add("dto.jpg", "DSC_1.JPG");
+    let out = env.run(&["-d", "YYYY/U"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(env.out_tree(), ["2017/01/20170102-030405123.jpg"]);
+}
+
+#[test]
+fn bad_path_options_are_rejected() {
+    let env = Env::new();
+    for bad in [
+        &["--prefix", "../up"][..],
+        &["--suffix", "/abs"],
+        &["--no-date-dir", "a//b"],
+        &["-d", "YYYY/../MM"],
+        &["-d", ""],
+    ] {
+        let out = env.cmd(bad).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{bad:?}");
+    }
+}
