@@ -399,3 +399,75 @@ fn delete_verified(src: &Path, of: &Path, size: u64, dev_ino: (u64, u64)) -> Res
     }
     fs::remove_file(src).map_err(|e| format!("delete duplicate: {e}"))
 }
+
+/// What wave 3 (`--rmdirs`) did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RmdirTotals {
+    pub dirs: usize,
+    pub junk: usize,
+    pub errors: Vec<String>,
+}
+
+/// Wave 3: removes source folders the plan expects to be empty, deepest
+/// first. Each folder is listed again right before removal and kept unless
+/// it holds only junk files (decision Q4), so a failed move upstream simply
+/// leaves its folder in place. `remove_dir` itself never deletes contents.
+pub fn remove_dirs(rmdirs: &[plan::RmDir], dry_run: bool, stop: &Stop) -> RmdirTotals {
+    let mut t = RmdirTotals::default();
+    for d in rmdirs {
+        if dry_run {
+            let mut lines = vec![format!("[dry-run] would rmdir {}", d.path.display())];
+            lines.extend(
+                d.junk
+                    .iter()
+                    .map(|j| format!("[dry-run] would   - {}", j.display())),
+            );
+            emit(&lines.join("\n"));
+            t.dirs += 1;
+            t.junk += d.junk.len();
+            continue;
+        }
+        if stop.reason().is_some() {
+            break;
+        }
+        match remove_if_junk_only(&d.path) {
+            Ok(Some(junk)) => {
+                let mut lines = vec![format!("rmdir {}", d.path.display())];
+                lines.extend(junk.iter().map(|j| format!("  - {}", j.display())));
+                emit(&lines.join("\n"));
+                t.dirs += 1;
+                t.junk += junk.len();
+            }
+            Ok(None) => log::debug!("kept {} (not empty)", d.path.display()),
+            Err(e) => {
+                log::error!("{}: remove folder: {e}", d.path.display());
+                t.errors
+                    .push(format!("{}: remove folder: {e}", d.path.display()));
+            }
+        }
+    }
+    t
+}
+
+/// Removes `dir` if it holds nothing but junk files; returns the junk
+/// deleted, or `None` if the folder had other content.
+fn remove_if_junk_only(dir: &Path) -> std::io::Result<Option<Vec<PathBuf>>> {
+    let mut junk = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !plan::is_removable_junk(&entry) {
+            return Ok(None);
+        }
+        junk.push(entry.path());
+    }
+    junk.sort();
+    for j in &junk {
+        fs::remove_file(j)?;
+    }
+    match fs::remove_dir(dir) {
+        Ok(()) => Ok(Some(junk)),
+        // Something appeared meanwhile: keep the folder.
+        Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(None),
+        Err(e) => Err(e),
+    }
+}

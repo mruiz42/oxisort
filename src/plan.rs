@@ -20,8 +20,8 @@ use rayon::prelude::*;
 
 use crate::extract::{ExtractError, Extracted};
 use crate::hash;
-use crate::model::{Action, Config, Kind, Mode, PlannedSidecar};
-use crate::scan::{Sidecar, SidecarForm};
+use crate::model::{Action, Config, Kind, Mode, PlannedSidecar, SkipReason};
+use crate::scan::{DirInfo, Sidecar, SidecarForm, is_junk};
 
 /// Guard against pathological inputs: `stem-9999.ext` is the last name tried.
 pub const MAX_COLLISIONS: u32 = 9_999;
@@ -30,6 +30,16 @@ pub const MAX_COLLISIONS: u32 = 9_999;
 #[derive(Debug, Default)]
 pub struct Plan {
     pub actions: Vec<Action>,
+    /// Source folders `--rmdirs` will remove, deepest first.
+    pub rmdirs: Vec<RmDir>,
+}
+
+/// A source folder expected to be empty (apart from junk) after the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RmDir {
+    pub path: PathBuf,
+    /// Junk files (`.DS_Store` …) to delete first (decision Q4).
+    pub junk: Vec<PathBuf>,
 }
 
 /// Where one file should go, before collision handling.
@@ -205,13 +215,20 @@ fn candidate_keys(c: &Candidate) -> Vec<ChainKey> {
 /// Builds the plan from extraction results (in scan order).
 pub fn build(
     items: Vec<Result<Extracted, ExtractError>>,
+    dirs_scanned: &[DirInfo],
     cfg: &Config,
     pool: &rayon::ThreadPool,
 ) -> Plan {
     let staged: Vec<Result<Candidate, Action>> = items
         .into_iter()
         .map(|item| match item {
-            Ok(x) => Ok(candidate(x, cfg)),
+            Ok(x) => match skip_reason(&x, cfg) {
+                Some(reason) => Err(Action::Skip {
+                    src: x.entry.path,
+                    reason,
+                }),
+                None => Ok(candidate(x, cfg)),
+            },
             Err(e) => Err(Action::Fail {
                 src: e.entry.path,
                 error: e.message,
@@ -228,9 +245,86 @@ pub fn build(
     let hashes = hash::hash_all(&hash_set(&cands, &index), pool);
 
     let delete = cfg.delete_duplicates && cfg.mode == Mode::Move;
-    Plan {
-        actions: resolve(staged, &index, &hashes, delete),
+    let actions = resolve(staged, &index, &hashes, delete);
+    let rmdirs = if cfg.rmdirs && cfg.mode == Mode::Move {
+        plan_rmdirs(dirs_scanned, &actions, &cfg.input)
+    } else {
+        Vec::new()
+    };
+    Plan { actions, rmdirs }
+}
+
+/// Plan step 3, the filters: `--file-type` (non-media is always out when it
+/// is set), `--skip-unknown`, then `--from`/`--to` on the capture day
+/// (inclusive; undated files are never range-filtered).
+fn skip_reason(x: &Extracted, cfg: &Config) -> Option<SkipReason> {
+    if cfg.file_type.is_some_and(|k| k != x.kind) {
+        return Some(SkipReason::FileType);
     }
+    let Some(date) = &x.date else {
+        return cfg.skip_unknown.then_some(SkipReason::NoDate);
+    };
+    let day = date.wall.date();
+    if cfg.from.is_some_and(|f| day < f) || cfg.to.is_some_and(|t| day > t) {
+        return Some(SkipReason::DateRange);
+    }
+    None
+}
+
+/// Simulates `--rmdirs`: which scanned folders end up holding nothing but
+/// junk once every planned move and duplicate deletion has happened.
+///
+/// Never candidates: the input root, unreadable folders, and any folder
+/// that is (or contains) a target folder of this run — which also covers
+/// organizing in place.
+pub(crate) fn plan_rmdirs(dirs: &[DirInfo], actions: &[Action], input: &Path) -> Vec<RmDir> {
+    let mut removed_in: HashMap<PathBuf, usize> = HashMap::new();
+    let mut protected: HashSet<PathBuf> = HashSet::new();
+    let mut count_removed = |p: &Path| {
+        if let Some(parent) = p.parent() {
+            *removed_in.entry(parent.to_path_buf()).or_default() += 1;
+        }
+    };
+    for a in actions {
+        match a {
+            Action::Transfer {
+                src, dst, sidecars, ..
+            } => {
+                count_removed(src);
+                sidecars.iter().for_each(|s| count_removed(&s.src));
+                protected.extend(dst.ancestors().skip(1).map(Path::to_path_buf));
+            }
+            Action::Duplicate {
+                src, delete: true, ..
+            } => count_removed(src),
+            _ => {}
+        }
+    }
+    let mut order: Vec<&DirInfo> = dirs.iter().collect();
+    order.sort_by(|a, b| b.depth.cmp(&a.depth).then_with(|| a.path.cmp(&b.path)));
+    let mut emptied_subdirs: HashMap<PathBuf, usize> = HashMap::new();
+    let mut out = Vec::new();
+    for d in order {
+        let gone = d.junk.len()
+            + removed_in.get(&d.path).copied().unwrap_or(0)
+            + emptied_subdirs.get(&d.path).copied().unwrap_or(0);
+        let empty = d.children.saturating_sub(gone) == 0;
+        if empty && !d.unreadable && d.path != input && !protected.contains(&d.path) {
+            if let Some(parent) = d.path.parent() {
+                *emptied_subdirs.entry(parent.to_path_buf()).or_default() += 1;
+            }
+            out.push(RmDir {
+                path: d.path.clone(),
+                junk: d.junk.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// True if a folder entry is junk that `--rmdirs` may delete.
+pub(crate) fn is_removable_junk(entry: &fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|t| t.is_file()) && is_junk(&entry.file_name())
 }
 
 fn candidate(x: Extracted, cfg: &Config) -> Candidate {
@@ -744,6 +838,56 @@ mod tests {
             false,
         );
         assert!(matches!(acts[0], Action::Fail { .. }));
+    }
+
+    fn dir(path: &str, depth: usize, children: usize, junk: &[&str]) -> DirInfo {
+        DirInfo {
+            path: path.into(),
+            depth,
+            children,
+            junk: junk.iter().map(PathBuf::from).collect(),
+            unreadable: false,
+        }
+    }
+
+    fn moved(src: &str, dst: &str) -> Action {
+        Action::Transfer {
+            src: src.into(),
+            dst: dst.into(),
+            kind: Kind::Image,
+            dated: true,
+            size: 1,
+            sidecars: vec![],
+        }
+    }
+
+    #[test]
+    fn rmdirs_simulation() {
+        let dirs = [
+            dir("/in", 0, 3, &[]),
+            dir("/in/a", 1, 2, &["/in/a/.DS_Store"]), // a.jpg + junk
+            dir("/in/b", 1, 2, &[]),                  // b.jpg + keep.txt
+            dir("/in/c", 1, 1, &[]),                  // c/d
+            dir("/in/c/d", 2, 1, &[]),                // d.jpg
+        ];
+        let actions = [
+            moved("/in/a/a.jpg", "/out/x/1.jpg"),
+            moved("/in/b/b.jpg", "/out/x/2.jpg"),
+            moved("/in/c/d/d.jpg", "/out/x/3.jpg"),
+        ];
+        let got: Vec<String> = plan_rmdirs(&dirs, &actions, Path::new("/in"))
+            .iter()
+            .map(|r| r.path.display().to_string())
+            .collect();
+        assert_eq!(got, ["/in/c/d", "/in/a", "/in/c"]);
+    }
+
+    #[test]
+    fn rmdirs_never_removes_target_folders() {
+        // Organizing in place: /in/2017 receives a file and must stay.
+        let dirs = [dir("/in", 0, 2, &[]), dir("/in/2017", 1, 1, &[])];
+        let actions = [moved("/in/2017/a.jpg", "/in/2017/b.jpg")];
+        assert!(plan_rmdirs(&dirs, &actions, Path::new("/in")).is_empty());
     }
 
     #[test]

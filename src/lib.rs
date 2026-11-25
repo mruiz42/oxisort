@@ -104,7 +104,7 @@ pub fn plan_run(cfg: &Config, pools: &Pools, progress: &Progress) -> (ScanResult
     bar.finish_and_clear();
 
     let spinner = progress.spinner("planning");
-    let plan = plan::build(extracted, cfg, &pools.cpu);
+    let plan = plan::build(extracted, &scanned.dirs, cfg, &pools.cpu);
     spinner.finish_and_clear();
     (scanned, plan)
 }
@@ -133,7 +133,11 @@ pub fn run(cfg: &Config, stop: &Stop, progress: &Progress) -> Result<RunSummary,
         exec::execute(&plan, cfg.mode, &pools.io, stop, progress)
     };
 
-    let summary = summarize(cfg, &scanned, &plan, &outcomes);
+    let mut summary = summarize(cfg, &scanned, &plan, &outcomes);
+    let rm = exec::remove_dirs(&plan.rmdirs, cfg.dry_run, stop);
+    summary.dirs_removed = rm.dirs;
+    summary.junk_removed = rm.junk;
+    summary.errors.extend(rm.errors);
     log::info!(
         target: SUMMARY,
         "{}",
