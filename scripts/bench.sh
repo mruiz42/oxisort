@@ -20,6 +20,14 @@ set_dir="${1:?usage: bench.sh SET SCRATCH [EXTERNAL_DIR]}"
 scratch="${2:?usage: bench.sh SET SCRATCH [EXTERNAL_DIR]}"
 external="${3:-}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
+# The commands below are shell strings (hyperfine --prepare, Python's
+# shell=True) with paths in single quotes, so a path holding ' would break
+# out of the quoting. Refuse those paths rather than run a mangled command.
+for p in "$set_dir" "$scratch" "$external" "$root"; do
+    case "$p" in
+        *"'"*) echo "bench: paths must not contain a single quote: $p" >&2; exit 2 ;;
+    esac
+done
 oxi="$root/target/release/oxisort"
 (cd "$root" && cargo build --release --quiet)
 command -v phockup >/dev/null || { echo "bench: phockup not found" >&2; exit 1; }
