@@ -164,3 +164,107 @@ pub struct Config {
     /// Absolute path of the `--log` file, if any (excluded from the scan).
     pub log_file: Option<PathBuf>,
 }
+
+/// Why a file was deliberately not processed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// `--file-type` excluded it (or it isn't media at all).
+    FileType,
+    /// Outside `--from`/`--to`.
+    DateRange,
+    /// No date and `--skip-unknown`.
+    NoDate,
+}
+
+impl SkipReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            SkipReason::FileType => "file type",
+            SkipReason::DateRange => "date range",
+            SkipReason::NoDate => "no date",
+        }
+    }
+}
+
+/// A sidecar's planned move alongside its media file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedSidecar {
+    pub src: PathBuf,
+    pub dst: PathBuf,
+}
+
+/// What the plan decided for one input file. Indices into the plan's action
+/// list serve as task ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Copy/move/link the file (and its sidecars) to `dst`.
+    Transfer {
+        src: PathBuf,
+        dst: PathBuf,
+        kind: Kind,
+        /// False when it goes to the no-date folder.
+        dated: bool,
+        /// Source size at extraction (progress throughput only).
+        size: u64,
+        sidecars: Vec<PlannedSidecar>,
+    },
+    /// Identical content already exists (or is planned) at `of`.
+    Duplicate {
+        src: PathBuf,
+        of: PathBuf,
+        /// Delete the source (`--move --delete-duplicates`).
+        delete: bool,
+        /// The transfer that will create `of`, if it isn't there yet.
+        depends_on: Option<usize>,
+        size: u64,
+        /// The source's `(dev, ino)`, re-checked before deleting.
+        dev_ino: (u64, u64),
+        /// Sidecars stay where they are.
+        sidecars_left: Vec<PathBuf>,
+    },
+    /// The file already is its own target (organizing in place).
+    AlreadyInPlace { src: PathBuf },
+    /// Filtered out.
+    Skip { src: PathBuf, reason: SkipReason },
+    /// Could not be planned (unreadable, too many collisions …).
+    Fail { src: PathBuf, error: String },
+}
+
+impl Action {
+    pub fn src(&self) -> &std::path::Path {
+        match self {
+            Action::Transfer { src, .. }
+            | Action::Duplicate { src, .. }
+            | Action::AlreadyInPlace { src }
+            | Action::Skip { src, .. }
+            | Action::Fail { src, .. } => src,
+        }
+    }
+}
+
+/// Why a planned task did not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotRun {
+    Interrupted,
+    DiskFull,
+    /// The transfer it depended on failed.
+    DependencyFailed,
+}
+
+/// What actually happened to one action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// `sidecar_errors` holds one message per sidecar that failed; the
+    /// media file itself made it.
+    Transferred {
+        sidecars: usize,
+        sidecar_errors: Vec<String>,
+    },
+    Duplicate {
+        deleted: bool,
+    },
+    AlreadyInPlace,
+    Skipped(SkipReason),
+    Failed(String),
+    NotRun(NotRun),
+}
