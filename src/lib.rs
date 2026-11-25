@@ -19,6 +19,7 @@ pub mod dateformat;
 pub mod exec;
 pub mod extract;
 pub mod fsops;
+pub mod hash;
 pub mod logging;
 pub mod metadata;
 pub mod model;
@@ -132,6 +133,22 @@ pub fn run(cfg: &Config, stop: &Stop, progress: &Progress) -> Result<RunSummary,
         exec::execute(&plan, cfg.mode, &pools.io, stop, progress)
     };
 
+    let summary = summarize(cfg, &scanned, &plan, &outcomes);
+    log::info!(
+        target: SUMMARY,
+        "{}",
+        summary.render(cfg.mode, started.elapsed(), plan.actions.len())
+    );
+    Ok(summary)
+}
+
+/// Folds scan counts and per-action outcomes into the run summary.
+pub fn summarize(
+    cfg: &Config,
+    scanned: &ScanResult,
+    plan: &Plan,
+    outcomes: &[model::Outcome],
+) -> RunSummary {
     let mut summary = RunSummary {
         dry_run: cfg.dry_run,
         scan: scanned.counts.clone(),
@@ -144,13 +161,8 @@ pub fn run(cfg: &Config, stop: &Stop, progress: &Progress) -> Result<RunSummary,
             .iter()
             .map(|(p, m)| format!("{}: {m}", p.display())),
     );
-    for (a, o) in plan.actions.iter().zip(&outcomes) {
+    for (a, o) in plan.actions.iter().zip(outcomes) {
         summary.add(a, o);
     }
-    log::info!(
-        target: SUMMARY,
-        "{}",
-        summary.render(cfg.mode, started.elapsed(), plan.actions.len())
-    );
-    Ok(summary)
+    summary
 }

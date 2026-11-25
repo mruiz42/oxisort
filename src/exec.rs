@@ -379,21 +379,22 @@ impl Exec<'_> {
 }
 
 /// Deletes a duplicate source only after re-checking, right now, that the
-/// copy it duplicates exists with the expected size and is a different
-/// file, and that the source itself is unchanged.
+/// copy it duplicates is a regular file (not a symlink that might point back
+/// at the source) with the expected size and a different inode, and that
+/// the source itself is unchanged.
 fn delete_verified(src: &Path, of: &Path, size: u64, dev_ino: (u64, u64)) -> Result<(), String> {
-    let of_meta =
-        fs::metadata(of).map_err(|e| format!("source kept: {} is gone: {e}", of.display()))?;
-    let of_id = fsops::dev_ino(of).map_err(|e| format!("source kept: {}: {e}", of.display()))?;
-    if of_meta.len() != size || of_id == dev_ino {
+    use std::os::unix::fs::MetadataExt;
+    let of_meta = fs::symlink_metadata(of)
+        .map_err(|e| format!("source kept: {} is gone: {e}", of.display()))?;
+    if !of_meta.is_file() || of_meta.len() != size || (of_meta.dev(), of_meta.ino()) == dev_ino {
         return Err(format!(
             "source kept: {} changed since planning",
             of.display()
         ));
     }
     let src_meta = fs::symlink_metadata(src).map_err(|e| format!("delete duplicate: {e}"))?;
-    let src_id = fsops::dev_ino(src).map_err(|e| format!("delete duplicate: {e}"))?;
-    if src_meta.len() != size || src_id != dev_ino {
+    if !src_meta.is_file() || src_meta.len() != size || (src_meta.dev(), src_meta.ino()) != dev_ino
+    {
         return Err("source kept: it changed since planning".to_owned());
     }
     fs::remove_file(src).map_err(|e| format!("delete duplicate: {e}"))
