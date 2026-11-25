@@ -116,7 +116,7 @@ fn destination_appearing_after_planning_is_never_overwritten() {
     .unwrap();
     let pools = oxisort::Pools::new(2, 2).unwrap();
     let progress = Progress::disabled();
-    let (scanned, plan) = oxisort::plan_run(&cfg, &pools, &progress);
+    let (scanned, plan) = oxisort::plan_run(&cfg, &pools, &Stop::new(), &progress);
 
     // Another process creates the planned destination in the meantime.
     let dst = env.output.join("2017/01/02/20170102-030405123.jpg");
@@ -131,4 +131,101 @@ fn destination_appearing_after_planning_is_never_overwritten() {
     assert_eq!(fs::read(&dst).unwrap(), b"someone else's file");
     let summary = oxisort::summarize(&cfg, &scanned, &plan, &outcomes);
     assert_eq!(summary.exit_code(), 1);
+}
+
+fn config(args: &[&std::ffi::OsStr]) -> oxisort::model::Config {
+    let mut argv: Vec<&std::ffi::OsStr> =
+        vec!["oxisort".as_ref(), "--tz".as_ref(), "+00:00".as_ref()];
+    argv.extend_from_slice(args);
+    oxisort::cli::parse_from(argv)
+        .unwrap()
+        .into_config()
+        .unwrap()
+}
+
+#[test]
+fn failed_move_keeps_its_in_input_duplicate() {
+    let env = Env::new();
+    let a = env.add("dto.jpg", "a/one.jpg");
+    let b = env.add("dto.jpg", "b/copy.jpg");
+    let cfg = config(&[
+        "--move".as_ref(),
+        "--delete-duplicates".as_ref(),
+        env.input.as_os_str(),
+        env.output.as_os_str(),
+    ]);
+    let pools = oxisort::Pools::new(2, 2).unwrap();
+    let progress = Progress::disabled();
+    let (scanned, plan) = oxisort::plan_run(&cfg, &pools, &Stop::new(), &progress);
+
+    // A's planned destination is taken by someone else, so A's move fails.
+    let dst = env.output.join("2017/01/02/20170102-030405123.jpg");
+    fs::create_dir_all(dst.parent().unwrap()).unwrap();
+    fs::write(&dst, b"someone else's file").unwrap();
+
+    let outcomes = exec::execute(&plan, cfg.mode, &pools.io, &Stop::new(), &progress);
+    assert!(matches!(outcomes[0], Outcome::Failed(_)), "{outcomes:?}");
+    assert_eq!(
+        outcomes[1],
+        Outcome::NotRun(oxisort::model::NotRun::DependencyFailed)
+    );
+    let original = fs::read(common::fixture("dto.jpg")).unwrap();
+    assert_eq!(fs::read(&a).unwrap(), original, "A stays in the input");
+    assert_eq!(fs::read(&b).unwrap(), original, "B is never deleted");
+    let summary = oxisort::summarize(&cfg, &scanned, &plan, &outcomes);
+    assert_eq!(summary.exit_code(), 1);
+}
+
+#[test]
+fn organizing_in_place_twice_is_stable() {
+    let env = Env::new();
+    env.add("dto.jpg", "x/one.jpg");
+    env.add("dto.jpg", "y/copy.jpg");
+    env.add("a.heic", "z/deep/two.heic");
+    let run = || {
+        assert_cmd::Command::cargo_bin("oxisort")
+            .unwrap()
+            .env("TZ", "UTC")
+            .args(["--tz", "+00:00", "--io-jobs", "1"])
+            .args(["--move", "--delete-duplicates", "--rmdirs"])
+            .arg(&env.input)
+            .arg(&env.input)
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+    let organized = env.in_tree();
+    assert_eq!(organized.len(), 2, "{organized:?}");
+    assert!(
+        organized.iter().all(|p| p.starts_with("20")),
+        "{organized:?}"
+    );
+
+    let second = run();
+    assert_eq!(second.status.code(), Some(0), "{}", stderr(&second));
+    let lines = sorted_lines(&second);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines.iter().all(|l| l.starts_with("in-place ")),
+        "{lines:?}"
+    );
+    assert_eq!(env.in_tree(), organized, "no target folder removed");
+}
+
+#[test]
+fn stop_before_execution_changes_nothing_and_reports_interruption() {
+    let env = Env::new();
+    let src = env.add("dto.jpg", "one.jpg");
+    let cfg = config(&[
+        "--move".as_ref(),
+        env.input.as_os_str(),
+        env.output.as_os_str(),
+    ]);
+    let stop = Stop::new();
+    stop.request(oxisort::model::NotRun::Interrupted);
+    let summary = oxisort::run(&cfg, &stop, &Progress::disabled()).unwrap();
+    assert!(src.exists());
+    assert!(env.out_tree().is_empty());
+    assert_eq!(summary.exit_code(), 130);
 }

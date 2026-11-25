@@ -187,7 +187,7 @@ fn planned(
     .into_config()
     .unwrap();
     let pools = oxisort::Pools::new(2, 2).unwrap();
-    let (scanned, plan) = oxisort::plan_run(&cfg, &pools, &Progress::disabled());
+    let (scanned, plan) = oxisort::plan_run(&cfg, &pools, &Stop::new(), &Progress::disabled());
     (cfg, pools, scanned, plan)
 }
 

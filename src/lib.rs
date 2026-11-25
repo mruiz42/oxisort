@@ -74,7 +74,16 @@ impl Pools {
 }
 
 /// Runs phases 1–4 (scan, extract, plan) without changing anything.
-pub fn plan_run(cfg: &Config, pools: &Pools, progress: &Progress) -> (ScanResult, Plan) {
+///
+/// `stop` is checked between phases, so a Ctrl-C during a long scan or
+/// extraction (slow SD card, 50k files) ends the run promptly: the result
+/// is then an empty plan, and the caller reports the interruption.
+pub fn plan_run(
+    cfg: &Config,
+    pools: &Pools,
+    stop: &Stop,
+    progress: &Progress,
+) -> (ScanResult, Plan) {
     let mut exclude: Vec<PathBuf> = Vec::new();
     if cfg.output != cfg.input && cfg.output.starts_with(&cfg.input) {
         exclude.push(cfg.output.clone());
@@ -92,6 +101,10 @@ pub fn plan_run(cfg: &Config, pools: &Pools, progress: &Progress) -> (ScanResult
         log::error!("{}: {msg}", path.display());
     }
 
+    if stopped_before(stop, "reading metadata") {
+        return (scanned, Plan::default());
+    }
+
     let entries = std::mem::take(&mut scanned.entries);
     let bar = progress.bar(entries.len() as u64, "reading metadata");
     let opts = ResolveOptions {
@@ -102,11 +115,23 @@ pub fn plan_run(cfg: &Config, pools: &Pools, progress: &Progress) -> (ScanResult
     };
     let extracted = extract_all(entries, &opts, &pools.cpu, &bar);
     bar.finish_and_clear();
+    if stopped_before(stop, "planning") {
+        return (scanned, Plan::default());
+    }
 
     let spinner = progress.spinner("planning");
-    let plan = plan::build(extracted, &scanned.dirs, cfg, &pools.cpu);
+    let plan = plan::build(extracted, &scanned.dirs, cfg, pools);
     spinner.finish_and_clear();
     (scanned, plan)
+}
+
+/// True (and logged) if the run should stop before `phase`.
+fn stopped_before(stop: &Stop, phase: &str) -> bool {
+    let stopped = stop.reason().is_some();
+    if stopped {
+        log::warn!("stopping before {phase}: no file was changed");
+    }
+    stopped
 }
 
 /// Runs the whole pipeline and logs the summary.
@@ -126,9 +151,11 @@ pub fn run(cfg: &Config, stop: &Stop, progress: &Progress) -> Result<RunSummary,
             ))
         })?;
     }
-    let (scanned, plan) = plan_run(cfg, &pools, progress);
+    let (scanned, plan) = plan_run(cfg, &pools, stop, progress);
     let outcomes = if cfg.dry_run {
         exec::simulate(&plan, cfg.mode)
+    } else if let Some(why) = stop.reason() {
+        exec::not_run(&plan, why)
     } else {
         exec::execute(&plan, cfg.mode, &pools.io, stop, progress)
     };
@@ -138,6 +165,11 @@ pub fn run(cfg: &Config, stop: &Stop, progress: &Progress) -> Result<RunSummary,
     summary.dirs_removed = rm.dirs;
     summary.junk_removed = rm.junk;
     summary.errors.extend(rm.errors);
+    // A Ctrl-C after the last task started (or during --rmdirs, which then
+    // keeps the remaining folders) leaves no NotRun outcome behind, but the
+    // run was still cut short: exit 130, not 0.
+    // `Stop::reason` also picks up SIGINT.
+    summary.interrupted |= stop.reason() == Some(model::NotRun::Interrupted);
     log::info!(
         target: SUMMARY,
         "{}",

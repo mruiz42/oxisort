@@ -124,11 +124,12 @@ pub struct Args {
     #[arg(long, requires = "move_files")]
     pub rmdirs: bool,
 
-    /// Threads for metadata reading and hashing [default: number of CPUs].
+    /// Threads for metadata reading [default: number of CPUs].
     #[arg(short = 'j', long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=512))]
     pub jobs: Option<u16>,
 
-    /// Parallel file transfers. Use 1 for spinning disks (HDD) and SD cards.
+    /// Parallel file transfers and duplicate hashing (full-file reads). Use 1
+    /// for spinning disks (HDD) and SD cards.
     #[arg(long, value_name = "N", default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=256))]
     pub io_jobs: u16,
 

@@ -143,6 +143,22 @@ fn predicted(a: &Action) -> Outcome {
     }
 }
 
+/// Outcomes when the run stops before execution starts: no I/O happens;
+/// transfers and duplicates are reported as not run.
+pub fn not_run(plan: &Plan, why: NotRun) -> Vec<Outcome> {
+    plan.actions
+        .iter()
+        .map(|a| match a {
+            Action::Transfer { .. } | Action::Duplicate { .. } => Outcome::NotRun(why),
+            Action::Fail { src, error } => {
+                log::error!("{}: {error}", src.display());
+                Outcome::Failed(error.clone())
+            }
+            other => predicted(other),
+        })
+        .collect()
+}
+
 /// Shared state for one execution.
 struct Exec<'a> {
     mode: Mode,

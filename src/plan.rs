@@ -18,13 +18,11 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
+use crate::Pools;
 use crate::extract::{ExtractError, Extracted};
 use crate::hash;
 use crate::model::{Action, Config, Kind, Mode, PlannedSidecar, SkipReason};
 use crate::scan::{DirInfo, Sidecar, SidecarForm, is_junk};
-
-/// Guard against pathological inputs: `stem-9999.ext` is the last name tried.
-pub const MAX_COLLISIONS: u32 = 9_999;
 
 /// The complete plan for a run.
 #[derive(Debug, Default)]
@@ -217,7 +215,7 @@ pub fn build(
     items: Vec<Result<Extracted, ExtractError>>,
     dirs_scanned: &[DirInfo],
     cfg: &Config,
-    pool: &rayon::ThreadPool,
+    pools: &Pools,
 ) -> Plan {
     let staged: Vec<Result<Candidate, Action>> = items
         .into_iter()
@@ -240,9 +238,12 @@ pub fn build(
     let mut dirs: Vec<PathBuf> = cands.iter().map(|c| c.target.dir.clone()).collect();
     dirs.sort();
     dirs.dedup();
-    let mut index = DestIndex::load(&dirs, pool);
-    index.stat_chains(&cands, pool);
-    let hashes = hash::hash_all(&hash_set(&cands, &index), pool);
+    let mut index = DestIndex::load(&dirs, &pools.cpu);
+    index.stat_chains(&cands, &pools.cpu);
+    // Hashing reads whole files, so it runs on the io pool: `--io-jobs`
+    // bounds concurrent full reads and spinning disks or SD cards aren't
+    // thrashed (listing and stat above are metadata-only).
+    let hashes = hash::hash_all(&hash_set(&cands, &index), &pools.io);
 
     let delete = cfg.delete_duplicates && cfg.mode == Mode::Move;
     let actions = resolve(staged, &index, &hashes, delete);
@@ -381,17 +382,112 @@ fn hash_set(cands: &[&Candidate], index: &DestIndex) -> Vec<PathBuf> {
     paths
 }
 
-/// Who holds a planned name.
+/// Something an input can turn out to be a copy of: the holder of name
+/// `stem[-n].ext` in some chain.
 #[derive(Debug, Clone)]
-enum Occupant {
-    Main {
-        task: usize,
-        src: PathBuf,
-        dst: PathBuf,
-        size: u64,
+enum Holder {
+    /// A transfer planned earlier in this run.
+    Planned { task: usize, dst: PathBuf },
+    /// A file already in the target folder.
+    Existing { path: PathBuf },
+}
+
+/// Holders at their chain positions `n`.
+type Positions = Vec<(u32, Holder)>;
+
+/// Holders keyed by what makes them match an input, so a candidate finds
+/// its duplicate in O(1) instead of walking its whole name chain. Each
+/// entry records the holder's position `n` in the chain.
+#[derive(Debug, Default)]
+struct MatchIndex {
+    by_ino: HashMap<(ChainKey, (u64, u64)), Positions>,
+    /// Equal hashes imply equal content and size, which is finer than the
+    /// size lookup the review asked for: only true duplicates are listed.
+    by_hash: HashMap<(ChainKey, blake3::Hash), Positions>,
+}
+
+impl MatchIndex {
+    fn add(
+        &mut self,
+        dir: &Path,
+        name: &OsStr,
         dev_ino: (u64, u64),
-    },
-    Sidecar,
+        hash: Option<blake3::Hash>,
+        holder: &Holder,
+    ) {
+        for (key, n) in chain_positions(dir, Path::new(name)) {
+            if let Some(h) = hash {
+                self.by_hash
+                    .entry((key.clone(), h))
+                    .or_default()
+                    .push((n, holder.clone()));
+            }
+            self.by_ino
+                .entry((key, dev_ino))
+                .or_default()
+                .push((n, holder.clone()));
+        }
+    }
+
+    /// The match the original chain walk would stop at: the lowest position
+    /// below `limit` (the free slot), an inode match winning a tie.
+    fn first(
+        &self,
+        key: &ChainKey,
+        c: &Candidate,
+        hash: Option<blake3::Hash>,
+        limit: u32,
+    ) -> Option<(bool, &Holder)> {
+        let ino = self
+            .by_ino
+            .get(&(key.clone(), c.dev_ino))
+            .into_iter()
+            .flatten()
+            .map(|(n, h)| ((*n, 0u8), (true, h)));
+        let content = hash
+            .and_then(|h| self.by_hash.get(&(key.clone(), h)))
+            .into_iter()
+            .flatten()
+            .map(|(n, h)| ((*n, 1u8), (false, h)));
+        ino.chain(content)
+            .filter(|((n, _), _)| *n < limit)
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, m)| m)
+    }
+}
+
+/// The chains a name sits in, with its position `n` in each: its own stem
+/// at `n = 1`, and — when the stem is `base-<n>` as [`numbered_name`] would
+/// write it (`n >= 2`, no leading zero) — `base` at `n`.
+fn chain_positions(dir: &Path, name: &Path) -> Vec<(ChainKey, u32)> {
+    let stem = fold(name.file_stem().unwrap_or_default());
+    let ext = name.extension().map(fold);
+    let mut out = vec![((dir.to_path_buf(), stem.clone(), ext.clone()), 1)];
+    if let Some((base, digits)) = stem.rsplit_once('-') {
+        if let Ok(n) = digits.parse::<u32>() {
+            if !base.is_empty() && n >= 2 && n.to_string() == digits {
+                out.push(((dir.to_path_buf(), base.to_owned(), ext), n));
+            }
+        }
+    }
+    out
+}
+
+/// Plan step 4d state. Correctness (no two tasks share a name, no existing
+/// name is reused) rests on `planned` + the `DestIndex` alone; `cursors`
+/// and `matches` only make the search fast. If a lookup key ever disagreed
+/// with the name map (exotic case folding), the effect is a missed
+/// duplicate, i.e. an extra `-n` copy, never an overwrite.
+struct Resolver<'a> {
+    index: &'a DestIndex,
+    hashes: &'a HashMap<PathBuf, blake3::Hash>,
+    delete: bool,
+    /// Every name planned so far (main files and sidecars), case-folded.
+    planned: HashSet<(PathBuf, String)>,
+    /// Per chain: every `n` below the cursor is known to be occupied.
+    /// Occupancy only grows, so the cursor never has to move back.
+    cursors: HashMap<ChainKey, u32>,
+    matches: MatchIndex,
 }
 
 /// Plan step 4d (pure): assigns final names in input order.
@@ -401,108 +497,85 @@ pub(crate) fn resolve(
     hashes: &HashMap<PathBuf, blake3::Hash>,
     delete_duplicates: bool,
 ) -> Vec<Action> {
-    let mut planned: HashMap<(PathBuf, String), Occupant> = HashMap::new();
+    let mut matches = MatchIndex::default();
+    for existing in index.dirs.values().flat_map(HashMap::values) {
+        let (Some(info), Some(dir), Some(name)) = (
+            existing.info,
+            existing.path.parent(),
+            existing.path.file_name(),
+        ) else {
+            continue;
+        };
+        // A symlink is never a duplicate copy, but a link to the input
+        // still counts as already in place (inode match).
+        let hash = (!info.symlink)
+            .then(|| hashes.get(&existing.path).copied())
+            .flatten();
+        let holder = Holder::Existing {
+            path: existing.path.clone(),
+        };
+        matches.add(dir, name, info.dev_ino, hash, &holder);
+    }
+    let mut r = Resolver {
+        index,
+        hashes,
+        delete: delete_duplicates,
+        planned: HashSet::new(),
+        cursors: HashMap::new(),
+        matches,
+    };
     staged
         .into_iter()
         .enumerate()
         .map(|(task, s)| match s {
-            Ok(c) => place(task, c, index, hashes, delete_duplicates, &mut planned),
+            Ok(c) => r.place(task, c),
             Err(action) => action,
         })
         .collect()
 }
 
-fn same_content(hashes: &HashMap<PathBuf, blake3::Hash>, a: &Path, b: &Path) -> bool {
-    matches!((hashes.get(a), hashes.get(b)), (Some(x), Some(y)) if x == y)
-}
+impl Resolver<'_> {
+    fn taken(&self, dir: &Path, folded: &str) -> bool {
+        self.index.get(dir, folded).is_some()
+            || self
+                .planned
+                .contains(&(dir.to_path_buf(), folded.to_owned()))
+    }
 
-fn place(
-    task: usize,
-    c: Candidate,
-    index: &DestIndex,
-    hashes: &HashMap<PathBuf, blake3::Hash>,
-    delete: bool,
-    planned: &mut HashMap<(PathBuf, String), Occupant>,
-) -> Action {
-    let t = &c.target;
-    let duplicate =
-        |c: Candidate, of: PathBuf, delete: bool, depends_on: Option<usize>| Action::Duplicate {
-            of,
-            delete,
-            depends_on,
-            size: c.size,
-            dev_ino: c.dev_ino,
-            sidecars_left: c.sidecars.into_iter().map(|s| s.path).collect(),
-            src: c.src,
+    /// Equivalent to walking `n = 1, 2, …` and stopping at the first name
+    /// that is either a copy of `c` or free for its whole bundle (main
+    /// name plus sidecars): find the free slot from the chain's cursor,
+    /// then take any match below it.
+    fn place(&mut self, task: usize, c: Candidate) -> Action {
+        let t = &c.target;
+        let first = numbered_name(&t.stem, t.ext.as_deref(), 1);
+        let (key, _) = chain_positions(&t.dir, Path::new(&first)).swap_remove(0);
+        let Some((n, name, side_names)) = self.free_slot(&key, &c) else {
+            return Action::Fail {
+                error: format!("no free name left for {}", t.dir.join(&t.stem).display()),
+                src: c.src,
+            };
         };
-    for n in 1..=MAX_COLLISIONS {
-        let name = numbered_name(&t.stem, t.ext.as_deref(), n);
-        let folded = fold(&name);
-        if let Some(occ) = planned.get(&(t.dir.clone(), folded.clone())) {
-            match occ {
-                Occupant::Main {
-                    task: other,
-                    src,
-                    dst,
-                    size,
-                    dev_ino,
-                } => {
-                    // Same inode (hard links in the input): a duplicate that
-                    // must never be deleted.
-                    if *dev_ino == c.dev_ino {
-                        let (dst, other) = (dst.clone(), *other);
-                        return duplicate(c, dst, false, Some(other));
-                    }
-                    if *size == c.size && same_content(hashes, src, &c.src) {
-                        let (dst, other) = (dst.clone(), *other);
-                        return duplicate(c, dst, delete, Some(other));
-                    }
-                }
-                Occupant::Sidecar => {}
-            }
-            continue;
-        }
-        if let Some(existing) = index.get(&t.dir, &folded) {
-            if let Some(info) = existing.info {
-                if info.dev_ino == c.dev_ino {
-                    return Action::AlreadyInPlace { src: c.src };
-                }
-                if !info.symlink
-                    && info.size == c.size
-                    && same_content(hashes, &existing.path, &c.src)
-                {
-                    return duplicate(c, existing.path.clone(), delete, None);
-                }
-            }
-            continue;
-        }
-        let stem_n = numbered_name(&t.stem, None, n);
-        let side_names: Vec<OsString> = c
-            .sidecars
-            .iter()
-            .map(|s| sidecar_name(&name, &stem_n, s, t.generated))
-            .collect();
-        let taken = |s: &OsString| {
-            let f = fold(s);
-            index.get(&t.dir, &f).is_some() || planned.contains_key(&(t.dir.clone(), f))
-        };
-        if side_names.iter().any(taken) {
-            continue;
+        let hash = self.hashes.get(&c.src).copied();
+        if let Some((by_inode, holder)) = self.matches.first(&key, &c, hash, n) {
+            return match holder.clone() {
+                Holder::Existing { .. } if by_inode => Action::AlreadyInPlace { src: c.src },
+                Holder::Existing { path } => duplicate(c, path, self.delete, None),
+                // Same inode (hard links in the input): never deleted.
+                Holder::Planned { task, dst } if by_inode => duplicate(c, dst, false, Some(task)),
+                Holder::Planned { task, dst } => duplicate(c, dst, self.delete, Some(task)),
+            };
         }
         let dst = t.dir.join(&name);
-        planned.insert(
-            (t.dir.clone(), folded),
-            Occupant::Main {
-                task,
-                src: c.src.clone(),
-                dst: dst.clone(),
-                size: c.size,
-                dev_ino: c.dev_ino,
-            },
-        );
+        self.planned.insert((t.dir.clone(), fold(&name)));
         for s in &side_names {
-            planned.insert((t.dir.clone(), fold(s)), Occupant::Sidecar);
+            self.planned.insert((t.dir.clone(), fold(s)));
         }
+        let holder = Holder::Planned {
+            task,
+            dst: dst.clone(),
+        };
+        self.matches.add(&t.dir, &name, c.dev_ino, hash, &holder);
         let sidecars = c
             .sidecars
             .iter()
@@ -512,20 +585,59 @@ fn place(
                 dst: t.dir.join(n),
             })
             .collect();
-        return Action::Transfer {
+        Action::Transfer {
             src: c.src,
             dst,
             kind: c.kind,
             dated: c.dated,
             size: c.size,
             sidecars,
-        };
+        }
     }
-    Action::Fail {
-        error: format!(
-            "more than {MAX_COLLISIONS} files want the name {}",
-            t.dir.join(&t.stem).display()
-        ),
+
+    /// The lowest `n` whose main name and sidecar names are all free,
+    /// starting at the chain's cursor (amortised O(1) per input even when
+    /// thousands of files share one timestamp). `None` only if `u32` runs
+    /// out, which needs more files than any filesystem folder can hold.
+    fn free_slot(
+        &mut self,
+        key: &ChainKey,
+        c: &Candidate,
+    ) -> Option<(u32, OsString, Vec<OsString>)> {
+        let t = &c.target;
+        let mut n = self.cursors.get(key).copied().unwrap_or(1);
+        let mut advancing = true;
+        loop {
+            let name = numbered_name(&t.stem, t.ext.as_deref(), n);
+            if self.taken(&t.dir, &fold(&name)) {
+                if advancing {
+                    self.cursors.insert(key.clone(), n.checked_add(1)?);
+                }
+            } else {
+                advancing = false;
+                let stem_n = numbered_name(&t.stem, None, n);
+                let side_names: Vec<OsString> = c
+                    .sidecars
+                    .iter()
+                    .map(|s| sidecar_name(&name, &stem_n, s, t.generated))
+                    .collect();
+                if !side_names.iter().any(|s| self.taken(&t.dir, &fold(s))) {
+                    return Some((n, name, side_names));
+                }
+            }
+            n = n.checked_add(1)?;
+        }
+    }
+}
+
+fn duplicate(c: Candidate, of: PathBuf, delete: bool, depends_on: Option<usize>) -> Action {
+    Action::Duplicate {
+        of,
+        delete,
+        depends_on,
+        size: c.size,
+        dev_ino: c.dev_ino,
+        sidecars_left: c.sidecars.into_iter().map(|s| s.path).collect(),
         src: c.src,
     }
 }
@@ -822,22 +934,73 @@ mod tests {
     }
 
     #[test]
-    fn collision_cap() {
+    fn many_files_sharing_one_timestamp_all_get_names_fast() {
+        // 12,000 > the old 9,999 cap; with a quadratic walk this took
+        // seconds, with per-chain cursors it is linear.
+        const N: u64 = 12_000;
+        let staged = (0..N)
+            .map(|i| Ok(cand(&format!("/in/{i}.jpg"), "x", i, i)))
+            .collect();
+        let started = std::time::Instant::now();
+        let acts = resolve(staged, &DestIndex::default(), &HashMap::new(), false);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(dst(&acts[0]), format!("{OUT}/x.jpg"));
+        assert_eq!(dst(&acts[N as usize - 1]), format!("{OUT}/x-{N}.jpg"));
+        let unique: HashSet<String> = acts.iter().map(dst).collect();
+        assert_eq!(unique.len(), N as usize);
+    }
+
+    #[test]
+    fn duplicate_found_deep_in_a_long_chain() {
+        // Existing x.jpg … x-500.jpg; the input equals x-300.jpg.
         let mut index = DestIndex::default();
-        for n in 1..=MAX_COLLISIONS {
+        for n in 1..=500 {
+            let name = numbered_name(OsStr::new("x"), Some(OsStr::new("jpg")), n);
             index.insert(
                 Path::new(OUT),
-                &numbered_name(OsStr::new("x"), Some(OsStr::new("jpg")), n),
-                None,
+                &name,
+                info(u64::from(n), 1000 + u64::from(n)),
             );
         }
+        let h = hashes(&[(&format!("{OUT}/x-300.jpg"), 3), ("/in/a.jpg", 3)]);
+        let acts = resolve(vec![Ok(cand("/in/a.jpg", "x", 300, 11))], &index, &h, true);
+        assert!(
+            matches!(&acts[0], Action::Duplicate { of, .. } if of == &PathBuf::from(format!("{OUT}/x-300.jpg"))),
+            "{:?}",
+            acts[0]
+        );
+        // A different file still gets the first free number.
         let acts = resolve(
-            vec![Ok(cand("/in/a.jpg", "x", 5, 11))],
+            vec![Ok(cand("/in/b.jpg", "x", 7, 12))],
             &index,
             &HashMap::new(),
             false,
         );
-        assert!(matches!(acts[0], Action::Fail { .. }));
+        assert_eq!(dst(&acts[0]), format!("{OUT}/x-501.jpg"));
+    }
+
+    #[test]
+    fn other_stem_holding_a_numbered_name_is_found() {
+        // "x-2" (a kept original name) lands on x's position 2.
+        let h = hashes(&[("/in/a.jpg", 1), ("/in/b.jpg", 1)]);
+        let staged = vec![
+            Ok(cand("/in/o.jpg", "x", 9, 10)),
+            Ok(cand("/in/a.jpg", "x-2", 5, 11)),
+            Ok(cand("/in/b.jpg", "x", 5, 12)),
+        ];
+        let acts = resolve(staged, &DestIndex::default(), &h, false);
+        assert_eq!(dst(&acts[1]), format!("{OUT}/x-2.jpg"));
+        assert!(
+            matches!(
+                acts[2],
+                Action::Duplicate {
+                    depends_on: Some(1),
+                    ..
+                }
+            ),
+            "{:?}",
+            acts[2]
+        );
     }
 
     fn dir(path: &str, depth: usize, children: usize, junk: &[&str]) -> DirInfo {
