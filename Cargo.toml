@@ -28,7 +28,6 @@ regex = "=1.13.1"
 blake3 = "=1.8.7"
 indicatif = "=0.18.6"
 log = "=0.4.35"
-anyhow = "=1.0.104"
 thiserror = "=2.0.21"
 libc = "=0.2.191"
 

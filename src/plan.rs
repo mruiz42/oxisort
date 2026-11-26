@@ -223,6 +223,9 @@ fn target_keys(t: &Target) -> Vec<ChainKey> {
 }
 
 /// Builds the plan from extraction results (in scan order).
+// `Result<Candidate, Action>` below is an either (pending vs. decided),
+// not an error path, so the size of `Action` is irrelevant.
+#[allow(clippy::result_large_err)]
 pub fn build(
     items: Vec<Result<Extracted, ExtractError>>,
     dirs_scanned: &[DirInfo],
