@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::exec::Stop;
-use crate::model::{Action, DupHow, Kind, Mode, NotRun, Outcome, SkipReason};
+use crate::model::{Action, DupHow, DupPolicy, Kind, Mode, NotRun, Outcome, SkipReason};
 use crate::scan::ScanCounts;
 
 /// How many error messages the summary lists before "and N more".
@@ -22,6 +22,12 @@ pub struct RunSummary {
     pub sidecars: usize,
     pub duplicates: usize,
     pub duplicates_deleted: usize,
+    pub duplicates_filed: usize,
+    pub duplicates_already_filed: usize,
+    /// How duplicates were handled, for the summary wording.
+    pub dup_policy: DupPolicy,
+    /// The duplicates folder's name (as given to `--duplicates-dir`).
+    pub dup_dir: String,
     pub in_place: usize,
     pub skipped_type: usize,
     pub skipped_range: usize,
@@ -58,11 +64,18 @@ impl RunSummary {
                 self.sidecars += sidecars;
                 self.errors.extend(sidecar_errors.iter().cloned());
             }
-            Outcome::Duplicate { how } => {
+            Outcome::Duplicate {
+                how,
+                sidecar_errors,
+            } => {
                 self.duplicates += 1;
-                if *how == DupHow::Deleted {
-                    self.duplicates_deleted += 1;
+                match how {
+                    DupHow::Deleted => self.duplicates_deleted += 1,
+                    DupHow::Filed => self.duplicates_filed += 1,
+                    DupHow::AlreadyFiled => self.duplicates_already_filed += 1,
+                    DupHow::Reported => {}
                 }
+                self.errors.extend(sidecar_errors.iter().cloned());
             }
             Outcome::AlreadyInPlace => self.in_place += 1,
             Outcome::Skipped(r) => match r {
@@ -96,6 +109,32 @@ impl RunSummary {
             1
         } else {
             0
+        }
+    }
+
+    /// `N (…)` for the duplicates line, worded by policy and mode.
+    fn duplicates_detail(&self, mode: Mode) -> String {
+        let n = self.duplicates;
+        match self.dup_policy {
+            DupPolicy::Skip => format!("{n} (left in place)"),
+            DupPolicy::Delete => format!("{n} (deleted {})", self.duplicates_deleted),
+            DupPolicy::File => {
+                let verb = match mode {
+                    Mode::Copy => "copied to",
+                    Mode::Move => "moved to",
+                    Mode::HardLink => "linked into",
+                    Mode::Symlink => "symlinked into",
+                };
+                let mut s = format!("{n} ({verb} {}/: {}", self.dup_dir, self.duplicates_filed);
+                if self.duplicates_already_filed > 0 {
+                    s.push_str(&format!(
+                        ", already there: {}",
+                        self.duplicates_already_filed
+                    ));
+                }
+                s.push(')');
+                s
+            }
         }
     }
 
@@ -133,11 +172,7 @@ impl RunSummary {
             self.sidecars
         );
         let _ = writeln!(s, "  no date:          {}", self.no_date);
-        let _ = writeln!(
-            s,
-            "  duplicates:       {} (deleted {})",
-            self.duplicates, self.duplicates_deleted
-        );
+        let _ = writeln!(s, "  duplicates:       {}", self.duplicates_detail(mode));
         let _ = writeln!(s, "  already in place: {}", self.in_place);
         let c = &self.scan;
         let _ = writeln!(
@@ -276,6 +311,78 @@ mod tests {
         assert!(text.contains("dry run finished"));
         assert!(text.contains("(dry run, nothing changed)"));
         assert!(text.contains("… and 5 more"));
+    }
+
+    fn dup_line(s: &RunSummary, mode: Mode) -> String {
+        let text = s.render(mode, Duration::from_millis(1), 1);
+        text.lines()
+            .find(|l| l.starts_with("  duplicates:"))
+            .unwrap()
+            .to_owned()
+    }
+
+    /// U23.
+    #[test]
+    fn duplicate_summary_wording() {
+        let mut s = RunSummary {
+            dup_dir: "duplicates".into(),
+            ..RunSummary::default()
+        };
+        let dup = |how| Outcome::Duplicate {
+            how,
+            sidecar_errors: vec![],
+        };
+        let a = transfer(Kind::Image, true);
+        s.add(&a, &dup(DupHow::Filed));
+        s.add(&a, &dup(DupHow::Filed));
+        for (mode, verb) in [
+            (Mode::Copy, "copied to"),
+            (Mode::Move, "moved to"),
+            (Mode::HardLink, "linked into"),
+            (Mode::Symlink, "symlinked into"),
+        ] {
+            assert_eq!(
+                dup_line(&s, mode),
+                format!("  duplicates:       2 ({verb} duplicates/: 2)")
+            );
+        }
+        s.add(&a, &dup(DupHow::AlreadyFiled));
+        assert_eq!(
+            dup_line(&s, Mode::Copy),
+            "  duplicates:       3 (copied to duplicates/: 2, already there: 1)"
+        );
+
+        let mut skip = RunSummary {
+            dup_policy: DupPolicy::Skip,
+            ..RunSummary::default()
+        };
+        skip.add(&a, &dup(DupHow::Reported));
+        assert_eq!(
+            dup_line(&skip, Mode::Copy),
+            "  duplicates:       1 (left in place)"
+        );
+
+        let mut del = RunSummary {
+            dup_policy: DupPolicy::Delete,
+            ..RunSummary::default()
+        };
+        del.add(&a, &dup(DupHow::Deleted));
+        del.add(&a, &dup(DupHow::Reported));
+        assert_eq!(
+            dup_line(&del, Mode::Move),
+            "  duplicates:       2 (deleted 1)"
+        );
+
+        // A sidecar that failed to follow its filed duplicate is an error.
+        let mut e = RunSummary::default();
+        e.add(
+            &a,
+            &Outcome::Duplicate {
+                how: DupHow::Filed,
+                sidecar_errors: vec!["x.xmp: sidecar copy: boom".into()],
+            },
+        );
+        assert_eq!(e.exit_code(), 1);
     }
 
     fn header(s: &RunSummary, mode: Mode) -> String {

@@ -108,7 +108,8 @@ fn every_fixture_lands_in_the_right_place() {
             "2021/06/07/20210607-080910.mov", // Apple key wall clock
             "2022/07/08/20220708-021011.mp4", // mvhd UTC with --tz +00:00
             "2023/01/02/20230102-030405.webp",
-            "unknown/a.orf", // no EXIF read for ORF (decision Q7)
+            "duplicates/fake.arw", // byte copy of a.tiff, original name kept
+            "unknown/a.orf",       // no EXIF read for ORF (decision Q7)
             "unknown/base.jpg",
             "unknown/nodate.mp4", // mvhd = 0 → 1904 → no date
             "unknown/notes.txt",
@@ -123,8 +124,9 @@ fn every_fixture_lands_in_the_right_place() {
     // fake.arw is a byte copy of a.tiff: a duplicate, whatever its name
     // or extension (global rule, plan amendment A1).
     let dup_line = format!(
-        "dup {} == {}",
+        "dup-copy {} -> {} (duplicate of {})",
         env.input.join("fake.arw").display(),
+        env.output.join("duplicates/fake.arw").display(),
         env.output.join("2019/03/04/20190304-050607.tiff").display()
     );
     assert!(
@@ -134,7 +136,10 @@ fn every_fixture_lands_in_the_right_place() {
     );
     let err = stderr(&out);
     assert!(err.contains("(images 12, videos 5, other 1)"), "{err}");
-    assert!(err.contains("duplicates:       1"), "{err}");
+    assert!(
+        err.contains("duplicates:       1 (copied to duplicates/: 1)"),
+        "{err}"
+    );
     assert!(err.contains("no date:          5"), "{err}");
 }
 

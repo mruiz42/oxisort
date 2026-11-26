@@ -228,12 +228,13 @@ fn delete_duplicates_only_verified_and_never_same_inode() {
     assert_eq!(env.out_tree(), [DST]);
     assert!(stdout(&out).contains("dup-deleted "));
 
-    // Without the flag, duplicates stay.
+    // Without the flag, duplicates are moved into the duplicates folder.
     let env2 = Env::new();
     env2.add("dto.jpg", "a/one.jpg");
-    let kept = env2.add("dto.jpg", "b/copy.jpg");
+    let dup = env2.add("dto.jpg", "b/copy.jpg");
     assert_eq!(env2.run(&["--move"]).status.code(), Some(0));
-    assert!(kept.exists());
+    assert!(!dup.exists());
+    assert_eq!(env2.out_tree(), [DST, "duplicates/b/copy.jpg"]);
 }
 
 #[test]
@@ -279,4 +280,59 @@ fn rmdirs_removes_emptied_and_junk_only_folders() {
     assert_eq!(dry_rm, real_rm, "dry-run predicts the removals");
     assert_eq!(real_rm.iter().filter(|l| l.starts_with("rmdir")).count(), 3);
     assert!(stderr(&out).contains("folders removed:  3 (junk files removed 1)"));
+}
+
+/// I18 (decision A1-Q1 = B): duplicates are filed in the run's own mode.
+#[test]
+fn link_and_symlink_duplicates_follow_q1() {
+    let env = Env::new();
+    env.add("dto.jpg", "a/one.jpg");
+    let copy = env.add("dto.jpg", "b/copy.jpg");
+    let out = env.run(&["--link", "--io-jobs", "1"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let filed = env.output.join("duplicates/b/copy.jpg");
+    let ino = |p: &std::path::Path| fs::metadata(p).unwrap().ino();
+    assert_eq!(ino(&filed), ino(&copy), "a hard link, no bytes copied");
+    assert!(stdout(&out).contains("dup-link "), "{}", stdout(&out));
+    assert!(stderr(&out).contains("(linked into duplicates/: 1)"));
+
+    let env = Env::new();
+    env.add("dto.jpg", "a/one.jpg");
+    let copy = env.add("dto.jpg", "b/copy.jpg");
+    let out = env.run(&["--symlink", "--io-jobs", "1"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let filed = env.output.join("duplicates/b/copy.jpg");
+    assert!(
+        fs::symlink_metadata(&filed)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_link(&filed).unwrap(), copy);
+    assert!(stderr(&out).contains("(symlinked into duplicates/: 1)"));
+}
+
+/// I18 (decision A1-Q2 = A): a second --link run writes nothing. The kept
+/// file's inode is in OUT, so it is in place; its duplicate is already
+/// linked into the duplicates folder.
+#[test]
+fn link_rerun_is_in_place() {
+    let env = Env::new();
+    env.add("dto.jpg", "a/one.jpg");
+    env.add("dto.jpg", "b/copy.jpg");
+    assert_eq!(env.run(&["--link"]).status.code(), Some(0));
+    let before = env.out_tree();
+    let again = env.run(&["--link", "--io-jobs", "1"]);
+    assert_eq!(again.status.code(), Some(0), "{}", stderr(&again));
+    assert_eq!(env.out_tree(), before, "nothing new written");
+    let lines = common::sorted_lines(&again);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines.iter().any(|l| l.starts_with("in-place ")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("(already in ")),
+        "{lines:?}"
+    );
 }

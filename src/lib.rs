@@ -96,10 +96,12 @@ pub fn plan_run(
     exclude.extend(cfg.log_file.iter().cloned());
 
     let spinner = progress.spinner("scanning");
+    let exclude_ids: Vec<(u64, u64)> = fsops::dev_ino(&cfg.duplicates.dir).into_iter().collect();
     let mut scanned = scan::scan(&ScanOptions {
         root: &cfg.input,
         max_depth: cfg.max_depth,
         exclude: &exclude,
+        exclude_ids: &exclude_ids,
     });
     spinner.finish_and_clear();
     for (path, msg) in &scanned.errors {
@@ -193,6 +195,14 @@ pub fn summarize(
 ) -> RunSummary {
     let mut summary = RunSummary {
         dry_run: cfg.dry_run,
+        dup_policy: cfg.duplicates.policy,
+        dup_dir: cfg
+            .duplicates
+            .dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
         scan: scanned.counts.clone(),
         shared_sidecars: scanned.shared_sidecars.len(),
         ..RunSummary::default()

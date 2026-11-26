@@ -270,3 +270,35 @@ fn interrupt_reports_pending_duplicates_as_interrupted() {
     );
     assert!(text.contains("not run:          2 (interrupted)"), "{text}");
 }
+
+/// I16: a disk-full stop on the last task leaves no NotRun outcome, yet
+/// the header still says the run stopped (via `apply_stop`).
+#[test]
+fn disk_full_header_end_to_end() {
+    let env = Env::new();
+    env.add("dto.jpg", "dto.jpg");
+    let (cfg, pools, scanned, plan) = planned(&env);
+    let outcomes = exec::execute(
+        &plan,
+        cfg.mode,
+        &pools.io,
+        &Stop::new(),
+        &Progress::disabled(),
+    );
+    assert!(
+        matches!(outcomes[0], Outcome::Transferred { .. }),
+        "{outcomes:?}"
+    );
+    let mut summary = oxisort::summarize(&cfg, &scanned, &plan, &outcomes);
+    assert_eq!(summary.not_run, 0);
+    // ENOSPC on the final task: the stop flag is set, every task is done.
+    let stop = Stop::new();
+    stop.request(NotRun::DiskFull);
+    oxisort::report::apply_stop(&mut summary, &stop);
+    let text = summary.render(cfg.mode, Default::default(), 1);
+    assert!(
+        text.starts_with("oxisort: copy stopped: destination full after"),
+        "{text}"
+    );
+    assert_eq!(summary.exit_code(), 1);
+}

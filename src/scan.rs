@@ -94,6 +94,10 @@ pub struct ScanOptions<'a> {
     /// Paths (folders or files) to leave out entirely: the output subtree
     /// when it lies inside the input, and the log file.
     pub exclude: &'a [PathBuf],
+    /// Folders to leave out by `(dev, ino)`: the duplicates folder when it
+    /// lies inside the input (organizing in place), so a differently
+    /// spelled path can't sneak its files back in.
+    pub exclude_ids: &'a [(u64, u64)],
 }
 
 /// `.DS_Store`, `Thumbs.db`, `desktop.ini` and AppleDouble `._*` files.
@@ -172,7 +176,15 @@ pub fn scan(opts: &ScanOptions<'_>) -> ScanResult {
             continue;
         }
         if ft.is_dir() {
-            if is_skipped_dir(entry.file_name()) {
+            let excluded_id = !opts.exclude_ids.is_empty()
+                && entry.metadata().is_ok_and(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    opts.exclude_ids.contains(&(m.dev(), m.ino()))
+                });
+            if excluded_id {
+                log::debug!("skip {} (duplicates folder)", path.display());
+                it.skip_current_dir();
+            } else if is_skipped_dir(entry.file_name()) {
                 log::debug!("skip {} (system or library folder)", path.display());
                 res.counts.skipped_dirs += 1;
                 it.skip_current_dir();
@@ -323,6 +335,7 @@ mod tests {
             root,
             max_depth,
             exclude,
+            exclude_ids: &[],
         })
     }
 

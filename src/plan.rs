@@ -144,11 +144,11 @@ impl DestIndex {
         self.dirs.get(dir)?.get(folded)
     }
 
-    /// Stats every existing file in a chain some candidate belongs to.
-    fn stat_chains(&mut self, cands: &[&Candidate], pool: &rayon::ThreadPool) {
+    /// Stats every existing file in a chain some target belongs to.
+    fn stat_chains(&mut self, targets: &[&Target], pool: &rayon::ThreadPool) {
         let mut wanted: HashSet<(PathBuf, String)> = HashSet::new();
-        for c in cands {
-            for key in candidate_keys(c) {
+        for t in targets {
+            for key in target_keys(t) {
                 for name in self.chains.get(&key).into_iter().flatten() {
                     wanted.insert((key.0.clone(), name.clone()));
                 }
@@ -211,9 +211,9 @@ fn chain_keys(dir: &Path, name: &Path) -> Vec<ChainKey> {
     keys
 }
 
-fn candidate_keys(c: &Candidate) -> Vec<ChainKey> {
-    let name = numbered_name(&c.target.stem, c.target.ext.as_deref(), 1);
-    chain_keys(&c.target.dir, Path::new(&name))
+fn target_keys(t: &Target) -> Vec<ChainKey> {
+    let name = numbered_name(&t.stem, t.ext.as_deref(), 1);
+    chain_keys(&t.dir, Path::new(&name))
 }
 
 /// Builds the plan from extraction results (in scan order).
@@ -232,7 +232,20 @@ pub fn build(
                     src: x.entry.path,
                     reason,
                 }),
-                None => Ok(candidate(x, cfg)),
+                None => {
+                    let c = candidate(x, cfg);
+                    if inside_dup_dir(&c.target.dir, cfg) {
+                        Err(Action::Fail {
+                            error: format!(
+                                "target folder {} is inside the duplicates folder",
+                                c.target.dir.display()
+                            ),
+                            src: c.src,
+                        })
+                    } else {
+                        Ok(c)
+                    }
+                }
             },
             Err(e) => Err(Action::Fail {
                 src: e.entry.path,
@@ -246,10 +259,16 @@ pub fn build(
     dirs.sort();
     dirs.dedup();
     let mut index = DestIndex::load(&dirs, &pools.cpu);
-    index.stat_chains(&cands, &pools.cpu);
+    let targets: Vec<&Target> = cands.iter().map(|c| &c.target).collect();
+    index.stat_chains(&targets, &pools.cpu);
     // INPUT inside OUT (or equal to it): its files are candidates, not
-    // existing output. Compared by identity, like the duplicates folder.
-    let skip_dirs: Vec<DevIno> = crate::fsops::dev_ino(&cfg.input).into_iter().collect();
+    // existing output. The duplicates folder is never a keeper source.
+    // Both are compared by identity, so case or normalisation can't
+    // defeat the check.
+    let skip_dirs: Vec<DevIno> = [&cfg.input, &cfg.duplicates.dir]
+        .into_iter()
+        .filter_map(|p| crate::fsops::dev_ino(p).ok())
+        .collect();
     let out = OutIndex::build(
         &cfg.output,
         WalkSkip {
@@ -279,13 +298,299 @@ pub fn build(
         .collect();
     let hashes = dedupe::hash_contents(&members, &pools.io, stop);
 
-    let actions = resolve(staged, &index, &out, &hashes, cfg.duplicates.policy);
+    let mut actions = resolve(staged, &index, &out, &hashes, cfg.duplicates.policy);
+    if cfg.duplicates.policy == DupPolicy::File {
+        actions = into_dup_dir(actions, cfg, &hashes, pools, stop);
+    }
     let rmdirs = if cfg.rmdirs && cfg.mode == crate::model::Mode::Move {
         plan_rmdirs(dirs_scanned, &actions, &cfg.input)
     } else {
         Vec::new()
     };
     Plan { actions, rmdirs }
+}
+
+/// True if `dir` would put a main-tree file inside the duplicates folder
+/// (a `--date-format` whose first folder is its name). The CLI refuses the
+/// cases it can see (`--prefix`, `--no-date-dir`).
+fn inside_dup_dir(dir: &Path, cfg: &Config) -> bool {
+    let name = cfg.duplicates.dir.file_name().map(fold);
+    let first = dir
+        .strip_prefix(&cfg.output)
+        .ok()
+        .and_then(|rel| rel.components().next())
+        .map(|c| fold(c.as_os_str()));
+    first.is_some() && first == name
+}
+
+/// Plan step 4e (I/O part): lists the duplicates-folder targets and, for
+/// copy/link/symlink runs, stats and hashes the chain members there that
+/// could already hold a duplicate ("already filed"). Then places them.
+fn into_dup_dir(
+    actions: Vec<Action>,
+    cfg: &Config,
+    hashes: &HashMap<DevIno, blake3::Hash>,
+    pools: &Pools,
+    stop: &Stop,
+) -> Vec<Action> {
+    let targets: Vec<(Target, u64, DevIno, PathBuf)> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Duplicate {
+                src, size, dev_ino, ..
+            } => Some((
+                dup_target(src, &cfg.input, &cfg.duplicates.dir),
+                *size,
+                *dev_ino,
+                src.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    if targets.is_empty() {
+        return actions;
+    }
+    let mut dirs: Vec<PathBuf> = targets.iter().map(|t| t.0.dir.clone()).collect();
+    dirs.sort();
+    dirs.dedup();
+    let mut index = DestIndex::load(&dirs, &pools.cpu);
+    // A move empties the input, so it always files; copy-like runs would
+    // otherwise add another `-n` copy on every rerun of the same card.
+    let check_filed = cfg.mode != crate::model::Mode::Move;
+    let mut hashes = hashes.clone();
+    if check_filed {
+        let refs: Vec<&Target> = targets.iter().map(|t| &t.0).collect();
+        index.stat_chains(&refs, &pools.cpu);
+        let reps = filed_hash_reps(&targets, &index, &hashes);
+        hashes.extend(crate::hash::full_hashes(reps, &pools.io, stop));
+    }
+    file_duplicates(
+        actions,
+        &DupDir {
+            input: &cfg.input,
+            dir: &cfg.duplicates.dir,
+            index: &index,
+            hashes: &hashes,
+            check_filed,
+        },
+    )
+}
+
+/// The inodes worth hashing for the "already filed" test: chain members in
+/// the duplicates folder with a duplicate's size and another inode, and
+/// the duplicate itself when it has no hash yet (a hard-link duplicate).
+fn filed_hash_reps(
+    targets: &[(Target, u64, DevIno, PathBuf)],
+    index: &DestIndex,
+    hashes: &HashMap<DevIno, blake3::Hash>,
+) -> Vec<crate::hash::Rep> {
+    let mut reps: HashMap<DevIno, crate::hash::Rep> = HashMap::new();
+    let mut add = |path: &Path, size: u64, dev_ino: DevIno| {
+        if !hashes.contains_key(&dev_ino) {
+            reps.entry(dev_ino).or_insert_with(|| crate::hash::Rep {
+                path: path.to_path_buf(),
+                size,
+                dev_ino,
+                candidate: false,
+            });
+        }
+    };
+    for (t, size, dev_ino, src) in targets {
+        let key = own_chain(t);
+        let members = index.chains.get(&key).into_iter().flatten();
+        let mut any = false;
+        for name in members {
+            let Some(e) = index.get(&key.0, name) else {
+                continue;
+            };
+            let Some(info) = e.info.filter(|i| !i.symlink) else {
+                continue;
+            };
+            if info.size == *size && info.dev_ino != *dev_ino {
+                add(&e.path, info.size, info.dev_ino);
+                any = true;
+            }
+        }
+        if any {
+            add(src, *size, *dev_ino);
+        }
+    }
+    let mut v: Vec<crate::hash::Rep> = reps.into_values().collect();
+    v.sort_by(|a, b| a.path.cmp(&b.path));
+    v
+}
+
+/// Where a duplicate goes: `<dupdir>/<src relative to INPUT>`, keeping its
+/// original name and extension case.
+fn dup_target(src: &Path, input: &Path, dup_dir: &Path) -> Target {
+    let rel = src.strip_prefix(input).unwrap_or(src);
+    let parent = rel.parent().unwrap_or(Path::new(""));
+    Target {
+        dir: dup_dir.join(parent),
+        stem: src.file_stem().unwrap_or_default().to_owned(),
+        ext: src.extension().map(OsStr::to_owned),
+        generated: false,
+    }
+}
+
+/// Recovers how a sidecar was paired with its media file (as the scan
+/// did): `name.ext.xmp` follows `name.ext`; anything else is `name.xmp`.
+fn sidecar_form(media: &Path, sidecar: &Path) -> SidecarForm {
+    let side = sidecar.file_name().unwrap_or_default().to_string_lossy();
+    let media = media.file_name().unwrap_or_default().to_string_lossy();
+    let base = side.get(..side.len().saturating_sub(4)).unwrap_or("");
+    if base.eq_ignore_ascii_case(&media) {
+        SidecarForm::WithExt
+    } else {
+        SidecarForm::StemOnly
+    }
+}
+
+/// Inputs of plan step 4e.
+pub(crate) struct DupDir<'a> {
+    pub input: &'a Path,
+    /// `OUT/<--duplicates-dir>`.
+    pub dir: &'a Path,
+    /// Names in the duplicates-folder targets (chain members stat'ed when
+    /// `check_filed`).
+    pub index: &'a DestIndex,
+    pub hashes: &'a HashMap<DevIno, blake3::Hash>,
+    /// Copy/link/symlink: skip a duplicate already in its chain there.
+    pub check_filed: bool,
+}
+
+/// Plan step 4e (pure): turns every report-only duplicate into "file it at
+/// `dst`" (unique names, `-2`, `-3` … over the whole bundle, exactly like
+/// the main tree) or "already filed at `at`". Runs in action order, so the
+/// result is deterministic.
+pub(crate) fn file_duplicates(actions: Vec<Action>, dd: &DupDir<'_>) -> Vec<Action> {
+    let filed = FiledIndex::new(dd.index, dd.hashes);
+    let mut r = Resolver {
+        index: dd.index,
+        planned: HashSet::new(),
+        cursors: HashMap::new(),
+    };
+    actions
+        .into_iter()
+        .map(|a| {
+            let Action::Duplicate {
+                src,
+                of,
+                handling: DupHandling::Report,
+                depends_on,
+                size,
+                dev_ino,
+                sidecars_left,
+            } = a
+            else {
+                return a;
+            };
+            let target = dup_target(&src, dd.input, dd.dir);
+            let hash = dd.hashes.get(&dev_ino).copied();
+            let at = dd
+                .check_filed
+                .then(|| filed.find(&target, size, dev_ino, hash))
+                .flatten();
+            let handling = match at {
+                Some(at) => {
+                    return Action::Duplicate {
+                        src,
+                        of,
+                        handling: DupHandling::AlreadyFiled { at },
+                        depends_on,
+                        size,
+                        dev_ino,
+                        sidecars_left,
+                    };
+                }
+                None => {
+                    let sidecars = sidecars_left
+                        .iter()
+                        .map(|p| Sidecar {
+                            form: sidecar_form(&src, p),
+                            path: p.clone(),
+                        })
+                        .collect();
+                    let c = Candidate {
+                        src: src.clone(),
+                        size,
+                        dev_ino,
+                        kind: Kind::Other,
+                        dated: false,
+                        sidecars,
+                        target,
+                    };
+                    match r.place(c) {
+                        Action::Transfer { dst, sidecars, .. } => {
+                            DupHandling::File { dst, sidecars }
+                        }
+                        other => return other,
+                    }
+                }
+            };
+            Action::Duplicate {
+                src,
+                of,
+                handling,
+                depends_on,
+                size,
+                dev_ino,
+                sidecars_left: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+/// Chain members in the duplicates folder, by inode (any entry, a symlink
+/// resolving to it included) and by content (regular files only).
+struct FiledIndex {
+    by_ino: ChainInodes,
+    by_hash: HashMap<(ChainKey, u64, blake3::Hash), (u32, PathBuf)>,
+}
+
+impl FiledIndex {
+    fn new(index: &DestIndex, hashes: &HashMap<DevIno, blake3::Hash>) -> Self {
+        let mut by_hash: HashMap<(ChainKey, u64, blake3::Hash), (u32, PathBuf)> = HashMap::new();
+        for e in index.dirs.values().flat_map(HashMap::values) {
+            let (Some(info), Some(dir), Some(name)) = (e.info, e.path.parent(), e.path.file_name())
+            else {
+                continue;
+            };
+            let Some(h) = hashes.get(&info.dev_ino).filter(|_| !info.symlink) else {
+                continue;
+            };
+            for (key, n) in chain_positions(dir, Path::new(name)) {
+                let cand = (n, e.path.clone());
+                by_hash
+                    .entry((key, info.size, *h))
+                    .and_modify(|cur| {
+                        if cand < *cur {
+                            *cur = cand.clone();
+                        }
+                    })
+                    .or_insert(cand);
+            }
+        }
+        FiledIndex {
+            by_ino: ChainInodes::new(index),
+            by_hash,
+        }
+    }
+
+    /// A chain member, at any position, that already holds this content.
+    fn find(
+        &self,
+        t: &Target,
+        size: u64,
+        dev_ino: DevIno,
+        hash: Option<blake3::Hash>,
+    ) -> Option<PathBuf> {
+        if let Some(p) = self.by_ino.holder(t, dev_ino) {
+            return Some(p.to_path_buf());
+        }
+        let key = (own_chain(t), size, hash?);
+        self.by_hash.get(&key).map(|(_, p)| p.clone())
+    }
 }
 
 /// Plan step 3, the filters: `--file-type` (non-media is always out when it
@@ -306,7 +611,8 @@ fn skip_reason(x: &Extracted, cfg: &Config) -> Option<SkipReason> {
 }
 
 /// Simulates `--rmdirs`: which scanned folders end up holding nothing but
-/// junk once every planned move and duplicate deletion has happened.
+/// junk once every planned move, filed duplicate and duplicate deletion has
+/// happened.
 ///
 /// Never candidates: the input root, unreadable folders, and any folder
 /// that is (or contains) a target folder of this run — which also covers
@@ -333,6 +639,16 @@ pub(crate) fn plan_rmdirs(dirs: &[DirInfo], actions: &[Action], input: &Path) ->
                 handling: DupHandling::Delete,
                 ..
             } => count_removed(src),
+            // Only called for --move, so a filed duplicate leaves the input.
+            Action::Duplicate {
+                src,
+                handling: DupHandling::File { dst, sidecars },
+                ..
+            } => {
+                count_removed(src);
+                sidecars.iter().for_each(|s| count_removed(&s.src));
+                protected.extend(dst.ancestors().skip(1).map(Path::to_path_buf));
+            }
             _ => {}
         }
     }
@@ -409,17 +725,16 @@ impl ChainInodes {
         ChainInodes { by_ino }
     }
 
-    /// The existing path in `c`'s own chain that has `c`'s inode, if any.
-    fn holder(&self, c: &Candidate) -> Option<&Path> {
+    /// The existing path in `t`'s own chain that has inode `dev_ino`.
+    fn holder(&self, t: &Target, dev_ino: DevIno) -> Option<&Path> {
         self.by_ino
-            .get(&(own_chain(c), c.dev_ino))
+            .get(&(own_chain(t), dev_ino))
             .map(|(_, p)| p.as_path())
     }
 }
 
-/// The chain a candidate's names are drawn from (its stem at `n = 1`).
-fn own_chain(c: &Candidate) -> ChainKey {
-    let t = &c.target;
+/// The chain a target's names are drawn from (its stem at `n = 1`).
+fn own_chain(t: &Target) -> ChainKey {
     let first = numbered_name(&t.stem, t.ext.as_deref(), 1);
     chain_positions(&t.dir, Path::new(&first)).swap_remove(0).0
 }
@@ -529,7 +844,7 @@ pub(crate) fn resolve(
                 return Action::AlreadyInPlace { src: c.src };
             }
             if c.size == 0 {
-                if chain_inodes.holder(&c).is_some() {
+                if chain_inodes.holder(&c.target, c.dev_ino).is_some() {
                     return Action::AlreadyInPlace { src: c.src };
                 }
                 return r.place(c);
@@ -586,7 +901,7 @@ fn in_place_keepers(
         let holder = out_holders
             .get(&c.dev_ino)
             .copied()
-            .or_else(|| chain_inodes.holder(c));
+            .or_else(|| chain_inodes.holder(&c.target, c.dev_ino));
         let Some(holder) = holder else { continue };
         let rank: Rank = (dedupe::order_key(holder), c.src != holder, task);
         let keeper = Keeper::InPlace {
@@ -618,7 +933,7 @@ impl Resolver<'_> {
     /// Gives `c` the lowest `n` whose whole bundle (main name plus sidecar
     /// names) is free, and reserves those names.
     fn place(&mut self, c: Candidate) -> Action {
-        let key = own_chain(&c);
+        let key = own_chain(&c.target);
         let Some((name, side_names)) = self.free_slot(&key, &c) else {
             let t = &c.target;
             return Action::Fail {
@@ -691,7 +1006,9 @@ fn duplicate(
     policy: DupPolicy,
 ) -> Action {
     let handling = match policy {
-        DupPolicy::Skip => DupHandling::Report,
+        // Filing needs the duplicates-folder index; step 4e turns these
+        // into `File` / `AlreadyFiled` (`file_duplicates`).
+        DupPolicy::File | DupPolicy::Skip => DupHandling::Report,
         DupPolicy::Delete if c.dev_ino == of_dev_ino => DupHandling::KeepSameFile,
         DupPolicy::Delete => DupHandling::Delete,
     };
@@ -786,13 +1103,18 @@ pub(crate) fn sidecar_name(
     name
 }
 
-/// Every distinct folder that transfers write into, sorted.
+/// Every distinct folder that transfers and filed duplicates write into,
+/// sorted.
 pub fn target_dirs(plan: &Plan) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = plan
         .actions
         .iter()
         .filter_map(|a| match a {
-            Action::Transfer { dst, .. } => dst.parent().map(Path::to_path_buf),
+            Action::Transfer { dst, .. }
+            | Action::Duplicate {
+                handling: DupHandling::File { dst, .. },
+                ..
+            } => dst.parent().map(Path::to_path_buf),
             _ => None,
         })
         .collect();
@@ -1442,6 +1764,217 @@ mod tests {
         assert_eq!(chain_keys(Path::new("/d"), Path::new("a-b.jpg")).len(), 1);
     }
 
+    const DUPS: &str = "/out/duplicates";
+
+    /// A report-only duplicate as `resolve` leaves it for step 4e.
+    fn pending_dup(src: &str, ino: u64, sidecars: &[&str]) -> Action {
+        Action::Duplicate {
+            src: src.into(),
+            of: format!("{OUT}/x.jpg").into(),
+            handling: DupHandling::Report,
+            depends_on: Some(0),
+            size: 5,
+            dev_ino: (1, ino),
+            sidecars_left: sidecars.iter().map(PathBuf::from).collect(),
+        }
+    }
+
+    fn file_all(w: &World, actions: Vec<Action>, check_filed: bool) -> Vec<Action> {
+        file_duplicates(
+            actions,
+            &DupDir {
+                input: Path::new("/in"),
+                dir: Path::new(DUPS),
+                index: &w.dest,
+                hashes: &w.hashes,
+                check_filed,
+            },
+        )
+    }
+
+    fn filed(a: &Action) -> (String, Vec<String>) {
+        match a {
+            Action::Duplicate {
+                handling: DupHandling::File { dst, sidecars },
+                sidecars_left,
+                ..
+            } => {
+                assert!(sidecars_left.is_empty(), "sidecars travel with it");
+                let side = sidecars
+                    .iter()
+                    .map(|s| s.dst.display().to_string())
+                    .collect();
+                (dst.display().to_string(), side)
+            }
+            other => panic!("expected a filed duplicate, got {other:?}"),
+        }
+    }
+
+    /// U19.
+    #[test]
+    fn dupdir_placement() {
+        let d = format!("{DUPS}/a/b");
+        // The relative path and the original name are kept.
+        let w = World::default();
+        let acts = file_all(
+            &w,
+            vec![pending_dup(
+                "/in/a/b/IMG_1.JPG",
+                11,
+                &["/in/a/b/IMG_1.JPG.xmp", "/in/a/b/IMG_1.XMP"],
+            )],
+            true,
+        );
+        assert_eq!(
+            filed(&acts[0]),
+            (
+                format!("{d}/IMG_1.JPG"),
+                vec![format!("{d}/IMG_1.JPG.xmp"), format!("{d}/IMG_1.XMP")]
+            )
+        );
+
+        // A different file at the name gives -2 for the whole bundle; a
+        // stale sidecar name there (a gap) bumps it to -3.
+        let mut w = World::default();
+        w.dest
+            .insert(Path::new(&d), OsStr::new("IMG_1.JPG"), info(9, 90));
+        w.dest
+            .insert(Path::new(&d), OsStr::new("IMG_1-2.JPG.xmp"), None);
+        w.content(90, 1);
+        w.content(11, 2);
+        let acts = file_all(
+            &w,
+            vec![pending_dup(
+                "/in/a/b/IMG_1.JPG",
+                11,
+                &["/in/a/b/IMG_1.JPG.xmp"],
+            )],
+            true,
+        );
+        assert_eq!(
+            filed(&acts[0]),
+            (
+                format!("{d}/IMG_1-3.JPG"),
+                vec![format!("{d}/IMG_1-3.JPG.xmp")]
+            )
+        );
+
+        // Already filed, by inode or by content, at any chain position:
+        // nothing to write in copy-like modes, and sidecars stay.
+        let mut w = World::default();
+        w.dest
+            .insert(Path::new(&d), OsStr::new("IMG_1.JPG"), info(5, 90));
+        w.dest
+            .insert(Path::new(&d), OsStr::new("IMG_1-4.JPG"), info(5, 94));
+        w.dest
+            .insert(Path::new(&d), OsStr::new("IMG_1-7.JPG"), info(5, 12));
+        w.content(90, 1);
+        w.content(94, 3);
+        w.content(11, 3);
+        let acts = file_all(
+            &w,
+            vec![
+                pending_dup("/in/a/b/IMG_1.JPG", 11, &["/in/a/b/IMG_1.JPG.xmp"]),
+                pending_dup("/in/a/b/img_1.jpg", 12, &[]),
+            ],
+            true,
+        );
+        match &acts[0] {
+            Action::Duplicate {
+                handling: DupHandling::AlreadyFiled { at },
+                sidecars_left,
+                ..
+            } => {
+                assert_eq!(at, &PathBuf::from(format!("{d}/IMG_1-4.JPG")));
+                assert_eq!(sidecars_left.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            matches!(&acts[1], Action::Duplicate { handling: DupHandling::AlreadyFiled { at }, .. } if at == &PathBuf::from(format!("{d}/IMG_1-7.JPG"))),
+            "{:?}",
+            acts[1]
+        );
+
+        // A move always files (it costs no space and empties the input).
+        let acts = file_all(&w, vec![pending_dup("/in/a/b/IMG_1.JPG", 11, &[])], false);
+        assert_eq!(filed(&acts[0]).0, format!("{d}/IMG_1-2.JPG"));
+
+        // Other actions pass through untouched.
+        let t = moved("/in/x.jpg", "/out/x.jpg");
+        assert_eq!(file_all(&w, vec![t.clone()], true), [t]);
+    }
+
+    /// U20: a `--date-format` that renders into the duplicates folder.
+    #[test]
+    fn target_inside_dupdir_fails() {
+        let d = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(d.path()).unwrap();
+        fs::create_dir(root.join("in")).unwrap();
+        let cfg = crate::cli::parse_from([
+            "oxisort",
+            "-d",
+            "Duplicates/YYYY",
+            root.join("in").to_str().unwrap(),
+            root.join("out").to_str().unwrap(),
+        ])
+        .unwrap()
+        .into_config()
+        .unwrap();
+        assert!(inside_dup_dir(&root.join("out/Duplicates/2017"), &cfg));
+        assert!(!inside_dup_dir(&root.join("out/2017/duplicates"), &cfg));
+        assert!(!inside_dup_dir(&root.join("out/unknown"), &cfg));
+    }
+
+    /// U21.
+    #[test]
+    fn rmdirs_counts_filed_duplicates_and_protects_dupdir() {
+        let dirs = [
+            dir("/in", 0, 3, &[]),
+            dir("/in/a", 1, 2, &[]),          // x.jpg + x.jpg.xmp, both filed
+            dir("/in/duplicates", 1, 1, &[]), // in place: the dupdir itself
+            dir("/in/duplicates/a", 2, 1, &[]), // an earlier filing
+            dir("/in/b", 1, 1, &[]),          // a report-only duplicate stays
+        ];
+        let filed = Action::Duplicate {
+            src: "/in/a/x.jpg".into(),
+            of: "/in/2017/x.jpg".into(),
+            handling: DupHandling::File {
+                dst: "/in/duplicates/a/x-2.jpg".into(),
+                sidecars: vec![PlannedSidecar {
+                    src: "/in/a/x.jpg.xmp".into(),
+                    dst: "/in/duplicates/a/x-2.jpg.xmp".into(),
+                }],
+            },
+            depends_on: None,
+            size: 1,
+            dev_ino: (1, 1),
+            sidecars_left: vec![],
+        };
+        let reported = Action::Duplicate {
+            src: "/in/b/y.jpg".into(),
+            of: "/in/2017/x.jpg".into(),
+            handling: DupHandling::Report,
+            depends_on: None,
+            size: 1,
+            dev_ino: (1, 2),
+            sidecars_left: vec![],
+        };
+        let got: Vec<String> = plan_rmdirs(&dirs, &[filed, reported], Path::new("/in"))
+            .iter()
+            .map(|r| r.path.display().to_string())
+            .collect();
+        assert_eq!(got, ["/in/a"]);
+    }
+
+    #[test]
+    fn sidecar_form_is_recovered_from_names() {
+        let f = |m: &str, s: &str| sidecar_form(Path::new(m), Path::new(s));
+        assert_eq!(f("/i/A.JPG", "/i/A.JPG.xmp"), SidecarForm::WithExt);
+        assert_eq!(f("/i/A.JPG", "/i/a.jpg.XMP"), SidecarForm::WithExt);
+        assert_eq!(f("/i/A.JPG", "/i/A.xmp"), SidecarForm::StemOnly);
+    }
+
     // ---- U17 / U18: seeded differential test against a brute-force
     // reference that knows nothing about chains, classes or hashes.
 
@@ -1692,7 +2225,7 @@ mod tests {
                 .min()
         };
         let handling = |c: &Obj, keeper: u64| match case.policy {
-            DupPolicy::Skip => DupHandling::Report,
+            DupPolicy::File | DupPolicy::Skip => DupHandling::Report,
             DupPolicy::Delete if c.ino == keeper => DupHandling::KeepSameFile,
             DupPolicy::Delete => DupHandling::Delete,
         };

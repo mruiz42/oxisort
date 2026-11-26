@@ -3,7 +3,8 @@
 //! Order of work:
 //! 1. create every target folder (serial, sorted);
 //! 2. wave 1: transfers (media + sidecars) in parallel on the I/O pool;
-//! 3. wave 2: duplicates, which may depend on a wave-1 transfer.
+//! 3. wave 2: duplicates (filed into the duplicates folder, deleted or
+//!    reported), each after the wave-1 transfer it depends on.
 //!
 //! Workers never choose names (the plan fixed them), so the only contention
 //! left is with *other* processes, which the no-clobber primitives catch.
@@ -90,10 +91,28 @@ fn action_line(action: &Action, mode: Mode, outcome: &Outcome) -> Option<String>
                 sidecars_left,
                 ..
             },
-            Outcome::Duplicate { how },
+            Outcome::Duplicate { how, .. },
         ) => {
             let (src, of) = (src.display(), of.display());
             let mut s = match (how, handling) {
+                (DupHow::Filed, DupHandling::File { dst, sidecars }) => {
+                    let mut s = format!(
+                        "dup-{} {src} -> {} (duplicate of {of})",
+                        mode.verb(),
+                        dst.display()
+                    );
+                    for sc in sidecars {
+                        s.push_str(&format!(
+                            "\n  + {} -> {}",
+                            sc.src.display(),
+                            sc.dst.display()
+                        ));
+                    }
+                    s
+                }
+                (DupHow::AlreadyFiled, DupHandling::AlreadyFiled { at }) => {
+                    format!("dup {src} == {of} (already in {})", at.display())
+                }
                 (DupHow::Deleted, _) => format!("dup-deleted {src} == {of}"),
                 (_, DupHandling::KeepSameFile) => format!("dup {src} == {of} (same file, kept)"),
                 _ => format!("dup {src} == {of}"),
@@ -143,6 +162,7 @@ fn predicted(a: &Action) -> Outcome {
         },
         Action::Duplicate { handling, .. } => Outcome::Duplicate {
             how: predicted_dup(handling),
+            sidecar_errors: Vec::new(),
         },
         Action::AlreadyInPlace { .. } => Outcome::AlreadyInPlace,
         Action::Skip { reason, .. } => Outcome::Skipped(*reason),
@@ -152,6 +172,8 @@ fn predicted(a: &Action) -> Outcome {
 
 fn predicted_dup(handling: &DupHandling) -> DupHow {
     match handling {
+        DupHandling::File { .. } => DupHow::Filed,
+        DupHandling::AlreadyFiled { .. } => DupHow::AlreadyFiled,
         DupHandling::Delete => DupHow::Deleted,
         DupHandling::Report | DupHandling::KeepSameFile => DupHow::Reported,
     }
@@ -212,10 +234,20 @@ pub fn execute(
     stop: &Stop,
     progress: &Progress,
 ) -> Vec<Outcome> {
+    // Filed duplicates do real I/O too, so they count on the bar.
     let n_transfers = plan
         .actions
         .iter()
-        .filter(|a| matches!(a, Action::Transfer { .. }))
+        .filter(|a| {
+            matches!(
+                a,
+                Action::Transfer { .. }
+                    | Action::Duplicate {
+                        handling: DupHandling::File { .. },
+                        ..
+                    }
+            )
+        })
         .count();
     let ex = Exec {
         mode,
@@ -258,7 +290,6 @@ pub fn execute(
     for (i, o) in wave1 {
         outcomes[i] = Some(o);
     }
-    ex.bar.finish_and_clear();
 
     // Wave 2: duplicates (their dependency's outcome is final now).
     let dependency = |id: usize| match &outcomes[id] {
@@ -286,12 +317,13 @@ pub fn execute(
             .par_iter()
             .enumerate()
             .filter(|(_, a)| matches!(a, Action::Duplicate { .. }))
-            .map(|(i, a)| (i, ex.duplicate(a, deps[i])))
+            .map(|(i, a)| (i, ex.duplicate(a, deps[i], &dir_errors)))
             .collect()
     });
     for (i, o) in wave2 {
         outcomes[i] = Some(o);
     }
+    ex.bar.finish_and_clear();
 
     outcomes
         .into_iter()
@@ -395,7 +427,12 @@ impl Exec<'_> {
         self.bar.inc(1);
     }
 
-    fn duplicate(&self, a: &Action, dependency: Dependency) -> Outcome {
+    fn duplicate(
+        &self,
+        a: &Action,
+        dependency: Dependency,
+        dir_errors: &HashMap<PathBuf, String>,
+    ) -> Outcome {
         let Action::Duplicate {
             src,
             of,
@@ -427,7 +464,31 @@ impl Exec<'_> {
                 return Outcome::NotRun(NotRun::DependencyFailed);
             }
         }
+        let mut sidecar_errors = Vec::new();
         let how = match handling {
+            DupHandling::File { dst, sidecars } => {
+                if let Some(why) = self.stop.reason() {
+                    return Outcome::NotRun(why);
+                }
+                if let Some(err) = dst.parent().and_then(|p| dir_errors.get(p)) {
+                    return Outcome::Failed(err.clone());
+                }
+                let verb = self.mode.verb();
+                if let Err(e) = self.one(src, dst) {
+                    log::error!("{}: duplicate {verb}: {e}", src.display());
+                    self.tick(*size);
+                    return Outcome::Failed(format!("duplicate {verb}: {e}"));
+                }
+                for sc in sidecars {
+                    if let Err(e) = self.one(&sc.src, &sc.dst) {
+                        let msg = format!("{}: sidecar {verb}: {e}", sc.src.display());
+                        log::error!("{msg}");
+                        sidecar_errors.push(msg);
+                    }
+                }
+                self.tick(*size);
+                DupHow::Filed
+            }
             DupHandling::Delete => {
                 if let Some(why) = self.stop.reason() {
                     return Outcome::NotRun(why);
@@ -438,9 +499,13 @@ impl Exec<'_> {
                 }
                 DupHow::Deleted
             }
+            DupHandling::AlreadyFiled { .. } => DupHow::AlreadyFiled,
             DupHandling::Report | DupHandling::KeepSameFile => DupHow::Reported,
         };
-        let outcome = Outcome::Duplicate { how };
+        let outcome = Outcome::Duplicate {
+            how,
+            sidecar_errors,
+        };
         if let Some(line) = action_line(a, self.mode, &outcome) {
             emit(&line);
         }

@@ -116,7 +116,18 @@ pub struct Args {
     #[arg(long, value_name = "N")]
     pub max_depth: Option<u16>,
 
-    /// With --move: delete a source file that is a verified duplicate.
+    /// Folder under OUTPUT that receives duplicates, with their path
+    /// relative to INPUT kept [default: duplicates]. Moved with --move,
+    /// copied/linked/symlinked otherwise.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["skip_duplicates", "delete_duplicates"])]
+    pub duplicates_dir: Option<String>,
+
+    /// Leave duplicates where they are and only report them.
+    #[arg(long, conflicts_with = "delete_duplicates")]
+    pub skip_duplicates: bool,
+
+    /// With --move: delete a source file that is a verified duplicate
+    /// instead of filing it.
     #[arg(long, requires = "move_files")]
     pub delete_duplicates: bool,
 
@@ -233,6 +244,19 @@ impl Args {
             check_link_volumes(in_dev, out_dev)?;
         }
         let log_file = self.log.as_deref().map(absolute).transpose()?;
+        let policy = if self.delete_duplicates {
+            DupPolicy::Delete
+        } else if self.skip_duplicates {
+            DupPolicy::Skip
+        } else {
+            DupPolicy::File
+        };
+        // The default is applied here, not by clap, so it can never trip
+        // the conflict with --skip-duplicates / --delete-duplicates.
+        let dup_name = dup_dir_name(self.duplicates_dir.as_deref().unwrap_or(DEFAULT_DUP_DIR))?;
+        check_dup_name_free(&dup_name, prefix.as_deref(), &no_date_dir)?;
+        let dup_dir = output.join(&dup_name);
+        check_dup_dir(&dup_dir, &input)?;
 
         Ok(Config {
             input,
@@ -258,11 +282,8 @@ impl Args {
             // walkdir depth: files directly in INPUT are depth 1.
             max_depth: self.max_depth.map(usize::from),
             duplicates: Duplicates {
-                policy: if self.delete_duplicates {
-                    DupPolicy::Delete
-                } else {
-                    DupPolicy::Skip
-                },
+                policy,
+                dir: dup_dir,
             },
             rmdirs: self.rmdirs,
             jobs,
@@ -312,6 +333,73 @@ fn rel_path(flag: &str, raw: &str) -> Result<PathBuf, UsageError> {
         return Err(usage(format!("{flag} must not contain '..'")));
     }
     Ok(path)
+}
+
+/// Default `--duplicates-dir`.
+const DEFAULT_DUP_DIR: &str = "duplicates";
+
+/// `--duplicates-dir` must be exactly one normal folder name, so the
+/// duplicates folder is always a direct child of OUTPUT.
+fn dup_dir_name(raw: &str) -> Result<String, UsageError> {
+    let bad =
+        raw.is_empty() || raw == "." || raw == ".." || raw.contains('/') || raw.contains('\0');
+    if bad {
+        return Err(usage(format!(
+            "--duplicates-dir: '{raw}' must be a single folder name (no '/', not '.' or '..')"
+        )));
+    }
+    Ok(raw.to_owned())
+}
+
+/// The duplicates folder and the main tree must not overlap: a first
+/// output component equal to it (case-folded, as APFS compares) is refused.
+/// Date folders rendered from `--date-format` are checked at plan time.
+fn check_dup_name_free(
+    name: &str,
+    prefix: Option<&Path>,
+    no_date_dir: &Path,
+) -> Result<(), UsageError> {
+    let (flag, path) = match prefix {
+        Some(p) => ("--prefix", p),
+        None => ("--no-date-dir", no_date_dir),
+    };
+    let first = path.components().next().map(|c| c.as_os_str());
+    if first.is_some_and(|f| f.to_string_lossy().to_lowercase() == name.to_lowercase()) {
+        return Err(usage(format!(
+            "{flag} {} would put files inside the duplicates folder '{name}' \
+             (choose another --duplicates-dir)",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The duplicates folder, if it exists, must be a real folder (a symlink
+/// could redirect writes elsewhere), and INPUT must not lie inside it
+/// (compared by identity, so case or normalisation can't hide it).
+fn check_dup_dir(dir: &Path, input: &Path) -> Result<(), UsageError> {
+    let meta = match fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(_) => return Ok(()), // created on first use
+    };
+    if !meta.is_dir() {
+        return Err(usage(format!(
+            "duplicates folder {} exists and is not a folder (or is a symlink)",
+            dir.display()
+        )));
+    }
+    let id = (meta.dev(), meta.ino());
+    let inside = input
+        .ancestors()
+        .any(|a| fs::symlink_metadata(a).is_ok_and(|m| (m.dev(), m.ino()) == id));
+    if inside {
+        return Err(usage(format!(
+            "input {} is inside the duplicates folder {}",
+            input.display(),
+            dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Parses `--date-field`: space or comma separated, case-insensitive,
@@ -450,6 +538,72 @@ mod tests {
         assert_eq!(kind(&["--delete-duplicates"]), MissingRequiredArgument);
         assert_eq!(kind(&["--rmdirs"]), MissingRequiredArgument);
         assert!(args(&["--move", "--rmdirs", "--delete-duplicates"]).is_ok());
+    }
+
+    /// U22: the three duplicate policies exclude each other, and every
+    /// guard is a usage error (exit 2 in `main`).
+    #[test]
+    fn duplicate_flags() {
+        use clap::error::ErrorKind::ArgumentConflict;
+        assert_eq!(
+            kind(&["--duplicates-dir", "d", "--skip-duplicates"]),
+            ArgumentConflict
+        );
+        assert_eq!(
+            kind(&["-m", "--duplicates-dir", "d", "--delete-duplicates"]),
+            ArgumentConflict
+        );
+        assert_eq!(
+            kind(&["-m", "--skip-duplicates", "--delete-duplicates"]),
+            ArgumentConflict
+        );
+        assert!(args(&["--skip-duplicates"]).is_ok());
+        assert!(args(&["--duplicates-dir", "dups"]).is_ok());
+
+        for bad in ["", ".", "..", "a/b", "/x"] {
+            assert!(dup_dir_name(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(dup_dir_name("Dups 2024").unwrap(), "Dups 2024");
+
+        let p = |s: &str| PathBuf::from(s);
+        assert!(
+            check_dup_name_free("duplicates", Some(&p("Duplicates/x")), &p("unknown")).is_err()
+        );
+        assert!(check_dup_name_free("dups", None, &p("DUPS")).is_err());
+        assert!(check_dup_name_free("dups", Some(&p("photos")), &p("dups")).is_ok());
+        assert!(check_dup_name_free("duplicates", None, &p("unknown")).is_ok());
+
+        let d = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(d.path()).unwrap();
+        let dups = root.join("duplicates");
+        let input = root.join("in");
+        fs::create_dir(&input).unwrap();
+        assert!(check_dup_dir(&dups, &input).is_ok(), "missing is fine");
+        fs::write(&dups, b"file").unwrap();
+        assert!(
+            check_dup_dir(&dups, &input)
+                .unwrap_err()
+                .0
+                .contains("not a folder")
+        );
+        fs::remove_file(&dups).unwrap();
+        std::os::unix::fs::symlink(&input, &dups).unwrap();
+        assert!(
+            check_dup_dir(&dups, &input)
+                .unwrap_err()
+                .0
+                .contains("symlink")
+        );
+        fs::remove_file(&dups).unwrap();
+        fs::create_dir_all(dups.join("sub")).unwrap();
+        assert!(check_dup_dir(&dups, &input).is_ok());
+        let inner = root.join("Duplicates/sub"); // another spelling, same folder
+        assert!(
+            check_dup_dir(&dups, &inner)
+                .unwrap_err()
+                .0
+                .contains("inside")
+        );
     }
 
     #[test]

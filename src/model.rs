@@ -166,8 +166,12 @@ pub struct Config {
 }
 
 /// What happens to an input whose content already exists (plan A1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DupPolicy {
+    /// File it under `OUT/<dupdir>/<path relative to INPUT>`, in the run's
+    /// own mode (the default; decision A1-Q1).
+    #[default]
+    File,
     /// Report only; the source and its sidecars stay (`--skip-duplicates`).
     Skip,
     /// Delete the verified source (`--move --delete-duplicates`).
@@ -178,11 +182,21 @@ pub enum DupPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Duplicates {
     pub policy: DupPolicy,
+    /// `OUT/<--duplicates-dir>`. Always set: the name is reserved under OUT
+    /// for every policy (never scanned, never a keeper, never a target).
+    pub dir: PathBuf,
 }
 
 /// How the plan handles one duplicate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DupHandling {
+    /// Put it (and its sidecars) into the duplicates folder at `dst`.
+    File {
+        dst: PathBuf,
+        sidecars: Vec<PlannedSidecar>,
+    },
+    /// A copy is already in the duplicates folder at `at`: nothing to do.
+    AlreadyFiled { at: PathBuf },
     /// Report only.
     Report,
     /// Delete the source after re-verifying it (`--delete-duplicates`).
@@ -246,7 +260,8 @@ pub enum Action {
         size: u64,
         /// The source's `(dev, ino)`, re-checked before deleting.
         dev_ino: (u64, u64),
-        /// Sidecars stay where they are.
+        /// Sidecars that stay where they are (empty when filed: they go
+        /// with the duplicate).
         sidecars_left: Vec<PathBuf>,
     },
     /// The file already is its own target (organizing in place).
@@ -281,6 +296,8 @@ pub enum NotRun {
 /// What was done with a duplicate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DupHow {
+    Filed,
+    AlreadyFiled,
     Reported,
     Deleted,
 }
@@ -294,8 +311,11 @@ pub enum Outcome {
         sidecars: usize,
         sidecar_errors: Vec<String>,
     },
+    /// `sidecar_errors`: one message per sidecar that could not be filed
+    /// along with its duplicate.
     Duplicate {
         how: DupHow,
+        sidecar_errors: Vec<String>,
     },
     AlreadyInPlace,
     Skipped(SkipReason),

@@ -185,6 +185,33 @@ pub fn hash_groups(
     )
 }
 
+/// Full hashes of `reps` on `pool`, without the size grouping (for the
+/// handful of duplicates-folder chain members). Unreadable files are logged
+/// and left out; a stop leaves the rest out.
+pub fn full_hashes(
+    reps: Vec<Rep>,
+    pool: &rayon::ThreadPool,
+    stop: &Stop,
+) -> HashMap<DevIno, blake3::Hash> {
+    pool.install(|| {
+        reps.into_par_iter()
+            .map_init(Vec::new, |buf, r| {
+                if stop.reason().is_some() {
+                    return None;
+                }
+                match hash_file(&r.path, buf) {
+                    Ok(h) => Some((r.dev_ino, h)),
+                    Err(e) => {
+                        log::warn!("{}: cannot hash for duplicate check: {e}", r.path.display());
+                        None
+                    }
+                }
+            })
+            .flatten()
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
