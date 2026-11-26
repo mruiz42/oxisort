@@ -6,6 +6,7 @@
 *.[jJ][pP][eE][gG]
 *.[hH][eE][iI][cC]
 *.[hH][eE][iI][fF]
+*.[hH][iI][fF]
 *.[aA][vV][iI][fF]
 *.[pP][nN][gG]
 *.[wW][eE][bB][pP]
@@ -27,3 +28,6 @@
 *.[mM][kK][vV]
 *.[aA][vV][iI]
 !tests/fixtures/**
+
+# Local test libraries (real photos) never go in git
+/images/
