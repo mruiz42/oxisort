@@ -28,6 +28,7 @@ pub mod plan;
 pub mod report;
 pub mod scan;
 pub mod signal;
+pub mod tiffdate;
 
 use std::path::PathBuf;
 use std::time::Instant;

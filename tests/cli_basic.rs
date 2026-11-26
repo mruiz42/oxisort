@@ -80,6 +80,7 @@ const ALL_FIXTURES: &[&str] = &[
     "mvhd_only.mp4",
     "nodate.mp4",
     "notes.txt",
+    "sr2_far_data.arw",
     "zero_date.jpg",
 ];
 
@@ -108,8 +109,9 @@ fn every_fixture_lands_in_the_right_place() {
             "2021/06/07/20210607-080910.mov", // Apple key wall clock
             "2022/07/08/20220708-021011.mp4", // mvhd UTC with --tz +00:00
             "2023/01/02/20230102-030405.webp",
-            "duplicates/fake.arw", // byte copy of a.tiff, original name kept
-            "unknown/a.orf",       // no EXIF read for ORF (decision Q7)
+            "2026/01/02/20260102-061139705.arw", // nom-exif fails: tiffdate
+            "duplicates/fake.arw",               // byte copy of a.tiff, original name kept
+            "unknown/a.orf",                     // no EXIF read for ORF (decision Q7)
             "unknown/base.jpg",
             "unknown/nodate.mp4", // mvhd = 0 → 1904 → no date
             "unknown/notes.txt",
@@ -135,7 +137,7 @@ fn every_fixture_lands_in_the_right_place() {
         stdout(&out)
     );
     let err = stderr(&out);
-    assert!(err.contains("(images 12, videos 5, other 1)"), "{err}");
+    assert!(err.contains("(images 13, videos 5, other 1)"), "{err}");
     assert!(
         err.contains("duplicates:       1 (copied to duplicates/: 1)"),
         "{err}"

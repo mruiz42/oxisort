@@ -78,6 +78,7 @@ vid a.mkv 2020-05-06T07:08:09Z
 vid nodate.mp4 ""
 
 printf 'not media\n' > "$out/notes.txt"
+python3 "$(dirname "$0")/gen-sr2-arw.py" "$out/sr2_far_data.arw"
 
 # Normalise mtimes so mtime-based tests are reproducible.
 touch -t 201501020304.05 "$out"/*.jpg "$out"/*.heic "$out"/*.png "$out"/*.tiff \

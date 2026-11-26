@@ -25,3 +25,4 @@ local time by the script.
 | `a.mkv` | H.264 Matroska | DateUTC 2020-05-06 07:08:09Z |
 | `nodate.mp4` | H.264 MP4 | mvhd 0 (decodes to 1904) |
 | `notes.txt` | text | none (not media) |
+| `sr2_far_data.arw` | synthetic Sony A7C II-shaped TIFF header, no image (`scripts/gen-sr2-arw.py`): an IFD0 XMP block whose data ends past nom-exif's buffer, plus an SR2Private directory | DateTimeOriginal 2026:01:02 06:11:39, SubSecTimeOriginal 705, OffsetTimeOriginal -07:00, CreateDate 2026:01:02 06:11:39, ModifyDate 2026:01:02 06:11:40 (nom-exif fails; read by `tiffdate`) |

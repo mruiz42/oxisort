@@ -1,8 +1,13 @@
-//! Reads raw date metadata with nom-exif, falling back to kamadak-exif.
+//! Reads raw date metadata with nom-exif, with fallbacks when it fails.
 //!
-//! The fallback runs only when nom-exif fails *and* the content is a format
-//! kamadak scans cheaply (JPEG, PNG, WebP, HEIF/AVIF). It is never used for
-//! TIFF/RAW, because kamadak reads those to EOF (investigation risk 7).
+//! - kamadak-exif, only for formats it scans cheaply (JPEG, PNG, WebP,
+//!   HEIF/AVIF). Never for TIFF/RAW, because kamadak reads those to EOF
+//!   (investigation risk 7).
+//! - `tiffdate`, a seek-based IFD0 → ExifIFD date reader, for everything
+//!   else that starts with a TIFF header (ARW, NEF, DNG, CR2 …). It reads a
+//!   few hundred bytes; on a non-TIFF file it stops after 8.
+//!
+//! Fallbacks run only after nom-exif failed, so files it reads cost the same.
 //!
 //! Parsing is wrapped in `catch_unwind`: a parser panic on a hostile or
 //! broken file becomes a warning for that file, never a crash.
@@ -70,14 +75,23 @@ pub fn read(parser: &mut MediaParser, path: &Path, mut file: File, mime: Option<
         }
     };
     meta.warnings.push(format!("nom-exif: {nom_err}"));
-    if mime.is_some_and(|m| FALLBACK_MIMES.contains(&m)) {
-        match catch_unwind(|| read_kamadak(path)) {
-            Ok(Ok(exif)) => meta.exif = exif,
-            Ok(Err(e)) => meta.warnings.push(format!("kamadak-exif: {e}")),
-            Err(_) => meta.warnings.push("kamadak-exif panicked".to_owned()),
-        }
+    let (name, fallback): (&str, fn(&Path) -> Result<_, String>) =
+        if mime.is_some_and(|m| FALLBACK_MIMES.contains(&m)) {
+            ("kamadak-exif", read_kamadak)
+        } else {
+            ("tiff", read_tiff)
+        };
+    match catch_unwind(|| fallback(path)) {
+        Ok(Ok(exif)) => meta.exif = exif,
+        Ok(Err(e)) => meta.warnings.push(format!("{name}: {e}")),
+        Err(_) => meta.warnings.push(format!("{name} panicked")),
     }
     meta
+}
+
+fn read_tiff(path: &Path) -> Result<[Option<ExifStamp>; 3], String> {
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    crate::tiffdate::read(&mut file)
 }
 
 struct NomFound {
@@ -205,6 +219,29 @@ mod tests {
         // mvhd = 0 is reported by nom-exif as 1904; date::resolve drops it.
         let zero = read_fixture("nodate.mp4", None).media_create;
         assert!(zero.is_none_or(|d| d.timestamp() < 0), "{zero:?}");
+    }
+
+    /// A7C II layout: an IFD0 entry's data ends past nom-exif's buffer, so
+    /// nom-exif fails the whole parse; the date must still come out.
+    #[test]
+    fn tiff_raw_with_far_ifd0_data_still_has_its_date() {
+        let m = read_fixture("sr2_far_data.arw", Some("image/tiff"));
+        assert!(
+            m.warnings.iter().any(|w| w.contains("Incomplete")),
+            "the fixture must reproduce the nom-exif failure: {:?}",
+            m.warnings
+        );
+        let dto = m.exif[0].as_ref().expect("DateTimeOriginal");
+        assert_eq!(dto.wall.to_string(), "2026-01-02 06:11:39");
+        assert_eq!(dto.subsec.as_deref(), Some("705"));
+        assert_eq!(
+            m.exif[1].as_ref().unwrap().wall.to_string(),
+            "2026-01-02 06:11:39"
+        );
+        assert_eq!(
+            m.exif[2].as_ref().unwrap().wall.to_string(),
+            "2026-01-02 06:11:40"
+        );
     }
 
     #[test]
