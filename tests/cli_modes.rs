@@ -359,3 +359,37 @@ fn move_only_flags_refused_with_link_and_symlink() {
         }
     }
 }
+
+/// F4: a sidecar that fails to copy (injected here by making it unreadable)
+/// is shown as failed in the action line and listed as an error.
+#[test]
+fn failed_sidecar_is_not_printed_as_copied() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    env.add("dto.jpg", "dto.jpg");
+    let ok = env.write("dto.xmp", b"<ok/>");
+    let bad = env.write("dto.jpg.xmp", b"<unreadable/>");
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+    let out = env.run(&[]);
+    // Restore so the temp dir can be cleaned up.
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let (o, e) = (stdout(&out), stderr(&out));
+    let bad_dst = env.output.join(format!("{DST}.xmp"));
+    assert!(!bad_dst.exists());
+    assert!(
+        o.contains(&format!(
+            "  ! {} -> {} (failed)",
+            bad.display(),
+            bad_dst.display()
+        )),
+        "{o}"
+    );
+    assert!(
+        o.contains(&format!("  + {} -> ", ok.display())),
+        "the sidecar that made it is still listed: {o}"
+    );
+    assert!(!o.contains(&format!("  + {}", bad.display())), "{o}");
+    assert!(e.contains("dto.jpg.xmp: sidecar copy:"), "{e}");
+}

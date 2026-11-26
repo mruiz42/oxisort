@@ -62,7 +62,8 @@ impl RunSummary {
                     }
                 }
                 self.sidecars += sidecars;
-                self.errors.extend(sidecar_errors.iter().cloned());
+                self.errors
+                    .extend(sidecar_errors.iter().map(|e| e.message.clone()));
             }
             Outcome::Duplicate {
                 how,
@@ -75,7 +76,8 @@ impl RunSummary {
                     DupHow::AlreadyFiled => self.duplicates_already_filed += 1,
                     DupHow::Reported => {}
                 }
-                self.errors.extend(sidecar_errors.iter().cloned());
+                self.errors
+                    .extend(sidecar_errors.iter().map(|e| e.message.clone()));
             }
             Outcome::AlreadyInPlace => self.in_place += 1,
             Outcome::Skipped(r) => match r {
@@ -240,6 +242,7 @@ pub fn apply_stop(summary: &mut RunSummary, stop: &Stop) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SidecarError;
     use std::path::PathBuf;
 
     fn transfer(kind: Kind, dated: bool) -> Action {
@@ -292,7 +295,10 @@ mod tests {
             &transfer(Kind::Image, true),
             &Outcome::Transferred {
                 sidecars: 0,
-                sidecar_errors: vec!["x: y".into()],
+                sidecar_errors: vec![SidecarError {
+                    src: PathBuf::from("x"),
+                    message: "x: y".into(),
+                }],
             },
         );
         assert_eq!(side.exit_code(), 1);
@@ -379,7 +385,10 @@ mod tests {
             &a,
             &Outcome::Duplicate {
                 how: DupHow::Filed,
-                sidecar_errors: vec!["x.xmp: sidecar copy: boom".into()],
+                sidecar_errors: vec![SidecarError {
+                    src: PathBuf::from("x.xmp"),
+                    message: "x.xmp: sidecar copy: boom".into(),
+                }],
             },
         );
         assert_eq!(e.exit_code(), 1);

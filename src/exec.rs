@@ -20,7 +20,9 @@ use rayon::prelude::*;
 
 use crate::fsops::{self, FsError, MoveHow};
 use crate::logging::{ACTION, Progress};
-use crate::model::{Action, DeleteGuard, DupHandling, DupHow, Mode, NotRun, Outcome};
+use crate::model::{
+    Action, DeleteGuard, DupHandling, DupHow, Mode, NotRun, Outcome, PlannedSidecar, SidecarError,
+};
 use crate::plan::{self, Plan};
 
 /// Cooperative stop flag: set by SIGINT or a full destination; checked by
@@ -71,16 +73,10 @@ fn action_line(action: &Action, mode: Mode, outcome: &Outcome) -> Option<String>
             Action::Transfer {
                 src, dst, sidecars, ..
             },
-            Outcome::Transferred { .. },
+            Outcome::Transferred { sidecar_errors, .. },
         ) => {
             let mut s = format!("{} {} -> {}", mode.verb(), src.display(), dst.display());
-            for sc in sidecars {
-                s.push_str(&format!(
-                    "\n  + {} -> {}",
-                    sc.src.display(),
-                    sc.dst.display()
-                ));
-            }
+            push_sidecar_lines(&mut s, sidecars, sidecar_errors);
             s
         }
         (
@@ -91,7 +87,10 @@ fn action_line(action: &Action, mode: Mode, outcome: &Outcome) -> Option<String>
                 sidecars_left,
                 ..
             },
-            Outcome::Duplicate { how, .. },
+            Outcome::Duplicate {
+                how,
+                sidecar_errors,
+            },
         ) => {
             let (src, of) = (src.display(), of.display());
             let mut s = match (how, handling) {
@@ -101,13 +100,7 @@ fn action_line(action: &Action, mode: Mode, outcome: &Outcome) -> Option<String>
                         mode.verb(),
                         dst.display()
                     );
-                    for sc in sidecars {
-                        s.push_str(&format!(
-                            "\n  + {} -> {}",
-                            sc.src.display(),
-                            sc.dst.display()
-                        ));
-                    }
+                    push_sidecar_lines(&mut s, sidecars, sidecar_errors);
                     s
                 }
                 (DupHow::AlreadyFiled, DupHandling::AlreadyFiled { at }) => {
@@ -127,6 +120,25 @@ fn action_line(action: &Action, mode: Mode, outcome: &Outcome) -> Option<String>
         _ => return None,
     };
     Some(line)
+}
+
+/// One indented line per planned sidecar: `+` for those written, `!` for
+/// those in `errors` (their reason is in the error log), so the per-file log
+/// never claims a sidecar that isn't there.
+fn push_sidecar_lines(s: &mut String, sidecars: &[PlannedSidecar], errors: &[SidecarError]) {
+    for sc in sidecars {
+        let failed = errors.iter().any(|e| e.src == sc.src);
+        let (mark, note) = if failed {
+            ('!', " (failed)")
+        } else {
+            ('+', "")
+        };
+        s.push_str(&format!(
+            "\n  {mark} {} -> {}{note}",
+            sc.src.display(),
+            sc.dst.display()
+        ));
+    }
 }
 
 fn emit(line: &str) {
@@ -373,12 +385,13 @@ impl Exec<'_> {
                     match self.one(&sc.src, &sc.dst) {
                         Ok(()) => done += 1,
                         Err(e) => {
-                            log::error!("{}: sidecar {}: {e}", sc.src.display(), self.mode.verb());
-                            sidecar_errors.push(format!(
-                                "{}: sidecar {}: {e}",
-                                sc.src.display(),
-                                self.mode.verb()
-                            ));
+                            let message =
+                                format!("{}: sidecar {}: {e}", sc.src.display(), self.mode.verb());
+                            log::error!("{message}");
+                            sidecar_errors.push(SidecarError {
+                                src: sc.src.clone(),
+                                message,
+                            });
                         }
                     }
                 }
@@ -482,9 +495,12 @@ impl Exec<'_> {
                 }
                 for sc in sidecars {
                     if let Err(e) = self.one(&sc.src, &sc.dst) {
-                        let msg = format!("{}: sidecar {verb}: {e}", sc.src.display());
-                        log::error!("{msg}");
-                        sidecar_errors.push(msg);
+                        let message = format!("{}: sidecar {verb}: {e}", sc.src.display());
+                        log::error!("{message}");
+                        sidecar_errors.push(SidecarError {
+                            src: sc.src.clone(),
+                            message,
+                        });
                     }
                 }
                 self.tick(*size);
@@ -632,5 +648,70 @@ fn remove_if_junk_only(dir: &Path) -> std::io::Result<Option<Vec<PathBuf>>> {
         // Something appeared meanwhile: keep the folder.
         Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Kind;
+
+    fn sidecar(name: &str) -> PlannedSidecar {
+        PlannedSidecar {
+            src: PathBuf::from(format!("/in/{name}")),
+            dst: PathBuf::from(format!("/out/{name}")),
+        }
+    }
+
+    fn failed(name: &str) -> SidecarError {
+        SidecarError {
+            src: PathBuf::from(format!("/in/{name}")),
+            message: format!("/in/{name}: sidecar copy: No space left on device"),
+        }
+    }
+
+    /// F4: a sidecar that failed is shown as failed, never as `+`.
+    #[test]
+    fn failed_sidecars_are_not_listed_as_written() {
+        let transfer = Action::Transfer {
+            src: PathBuf::from("/in/a.arw"),
+            dst: PathBuf::from("/out/a.arw"),
+            kind: Kind::Image,
+            dated: true,
+            size: 1,
+            sidecars: vec![sidecar("a.arw.xmp"), sidecar("a.xmp")],
+        };
+        let outcome = Outcome::Transferred {
+            sidecars: 1,
+            sidecar_errors: vec![failed("a.arw.xmp")],
+        };
+        assert_eq!(
+            action_line(&transfer, Mode::Copy, &outcome).unwrap(),
+            "copy /in/a.arw -> /out/a.arw\n  \
+             ! /in/a.arw.xmp -> /out/a.arw.xmp (failed)\n  \
+             + /in/a.xmp -> /out/a.xmp"
+        );
+
+        let dup = Action::Duplicate {
+            src: PathBuf::from("/in/b.jpg"),
+            of: PathBuf::from("/out/a.jpg"),
+            handling: DupHandling::File {
+                dst: PathBuf::from("/out/duplicates/b.jpg"),
+                sidecars: vec![sidecar("b.xmp")],
+            },
+            size: 1,
+            dev_ino: (0, 0),
+            depends_on: None,
+            sidecars_left: vec![],
+        };
+        let outcome = Outcome::Duplicate {
+            how: DupHow::Filed,
+            sidecar_errors: vec![failed("b.xmp")],
+        };
+        assert_eq!(
+            action_line(&dup, Mode::Copy, &outcome).unwrap(),
+            "dup-copy /in/b.jpg -> /out/duplicates/b.jpg (duplicate of /out/a.jpg)\n  \
+             ! /in/b.xmp -> /out/b.xmp (failed)"
+        );
     }
 }

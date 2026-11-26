@@ -318,6 +318,15 @@ pub enum DupHow {
     Deleted,
 }
 
+/// A sidecar that failed to follow its media file. `src` lets the action
+/// line tell it apart from the sidecars that made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarError {
+    pub src: PathBuf,
+    /// The full error line, as listed in the summary.
+    pub message: String,
+}
+
 /// What actually happened to one action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -325,13 +334,13 @@ pub enum Outcome {
     /// media file itself made it.
     Transferred {
         sidecars: usize,
-        sidecar_errors: Vec<String>,
+        sidecar_errors: Vec<SidecarError>,
     },
     /// `sidecar_errors`: one message per sidecar that could not be filed
     /// along with its duplicate.
     Duplicate {
         how: DupHow,
-        sidecar_errors: Vec<String>,
+        sidecar_errors: Vec<SidecarError>,
     },
     AlreadyInPlace,
     Skipped(SkipReason),
