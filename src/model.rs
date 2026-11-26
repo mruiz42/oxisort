@@ -5,6 +5,7 @@
 //! on these plain types, not on another phase's internals.
 
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use chrono::{FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 
@@ -199,12 +200,27 @@ pub enum DupHandling {
     AlreadyFiled { at: PathBuf },
     /// Report only.
     Report,
-    /// Delete the source after re-verifying it (`--delete-duplicates`).
-    Delete,
+    /// Delete the source after re-verifying it and the kept copy
+    /// (`--delete-duplicates`).
+    Delete(DeleteGuard),
     /// `--delete-duplicates`, but the source is the same inode as the file
     /// it duplicates (a hard link): deleting it would lose nothing on disk
     /// yet remove a name the user made, so it is kept and reported.
     KeepSameFile,
+}
+
+/// What `--delete-duplicates` re-checks right before removing a source,
+/// besides sizes and inodes: both files must still have the modification
+/// time they had at planning, so a kept copy rewritten in place (same
+/// size, new bytes) since then keeps the source alive.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteGuard {
+    /// The source's mtime at planning.
+    pub src_mtime: Option<SystemTime>,
+    /// The kept copy's mtime at planning. Unused when this run writes the
+    /// kept copy itself (`depends_on` is set): it doesn't exist at planning,
+    /// and its mtime after a copy depends on the target's time resolution.
+    pub of_mtime: Option<SystemTime>,
 }
 
 /// Why a file was deliberately not processed.

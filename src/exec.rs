@@ -20,7 +20,7 @@ use rayon::prelude::*;
 
 use crate::fsops::{self, FsError, MoveHow};
 use crate::logging::{ACTION, Progress};
-use crate::model::{Action, DupHandling, DupHow, Mode, NotRun, Outcome};
+use crate::model::{Action, DeleteGuard, DupHandling, DupHow, Mode, NotRun, Outcome};
 use crate::plan::{self, Plan};
 
 /// Cooperative stop flag: set by SIGINT or a full destination; checked by
@@ -174,7 +174,7 @@ fn predicted_dup(handling: &DupHandling) -> DupHow {
     match handling {
         DupHandling::File { .. } => DupHow::Filed,
         DupHandling::AlreadyFiled { .. } => DupHow::AlreadyFiled,
-        DupHandling::Delete => DupHow::Deleted,
+        DupHandling::Delete(_) => DupHow::Deleted,
         DupHandling::Report | DupHandling::KeepSameFile => DupHow::Reported,
     }
 }
@@ -439,6 +439,7 @@ impl Exec<'_> {
             handling,
             size,
             dev_ino,
+            depends_on,
             ..
         } = a
         else {
@@ -489,11 +490,17 @@ impl Exec<'_> {
                 self.tick(*size);
                 DupHow::Filed
             }
-            DupHandling::Delete => {
+            DupHandling::Delete(guard) => {
                 if let Some(why) = self.stop.reason() {
                     return Outcome::NotRun(why);
                 }
-                if let Err(msg) = delete_verified(src, of, *size, *dev_ino) {
+                let planned = Planned {
+                    size: *size,
+                    dev_ino: *dev_ino,
+                    guard: *guard,
+                    of_written_by_run: depends_on.is_some(),
+                };
+                if let Err(msg) = delete_verified(src, of, &planned) {
                     log::error!("{}: {msg}", src.display());
                     return Outcome::Failed(msg);
                 }
@@ -513,22 +520,43 @@ impl Exec<'_> {
     }
 }
 
+/// What planning recorded about a duplicate that is to be deleted.
+struct Planned {
+    /// Of both files (they have equal content).
+    size: u64,
+    /// The source's.
+    dev_ino: (u64, u64),
+    guard: DeleteGuard,
+    /// This run created the kept copy (wave 1): it had no mtime at planning.
+    of_written_by_run: bool,
+}
+
 /// Deletes a duplicate source only after re-checking, right now, that the
 /// copy it duplicates is a regular file (not a symlink that might point back
-/// at the source) with the expected size and a different inode, and that
-/// the source itself is unchanged.
-fn delete_verified(src: &Path, of: &Path, size: u64, dev_ino: (u64, u64)) -> Result<(), String> {
+/// at the source) with the planned size, a different inode and, unless this
+/// run just wrote it, the planned mtime; and that the source itself still
+/// has its planned size, inode and mtime. Content is not re-read: the mtime
+/// is what catches a same-size rewrite in place.
+fn delete_verified(src: &Path, of: &Path, p: &Planned) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     let of_meta = fs::symlink_metadata(of)
         .map_err(|e| format!("source kept: {} is gone: {e}", of.display()))?;
-    if !of_meta.is_file() || of_meta.len() != size || (of_meta.dev(), of_meta.ino()) == dev_ino {
+    let of_same_time = p.of_written_by_run || of_meta.modified().ok() == p.guard.of_mtime;
+    if !of_meta.is_file()
+        || of_meta.len() != p.size
+        || (of_meta.dev(), of_meta.ino()) == p.dev_ino
+        || !of_same_time
+    {
         return Err(format!(
             "source kept: {} changed since planning",
             of.display()
         ));
     }
     let src_meta = fs::symlink_metadata(src).map_err(|e| format!("delete duplicate: {e}"))?;
-    if !src_meta.is_file() || src_meta.len() != size || (src_meta.dev(), src_meta.ino()) != dev_ino
+    if !src_meta.is_file()
+        || src_meta.len() != p.size
+        || (src_meta.dev(), src_meta.ino()) != p.dev_ino
+        || src_meta.modified().ok() != p.guard.src_mtime
     {
         return Err("source kept: it changed since planning".to_owned());
     }

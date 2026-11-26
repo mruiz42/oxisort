@@ -19,6 +19,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use rayon::prelude::*;
 
@@ -27,7 +28,9 @@ use crate::dedupe::{self, ContentKey, Member, OutIndex, WalkSkip};
 use crate::exec::Stop;
 use crate::extract::{ExtractError, Extracted};
 use crate::hash::DevIno;
-use crate::model::{Action, Config, DupHandling, DupPolicy, Kind, PlannedSidecar, SkipReason};
+use crate::model::{
+    Action, Config, DeleteGuard, DupHandling, DupPolicy, Kind, PlannedSidecar, SkipReason,
+};
 use crate::scan::{DirInfo, Sidecar, SidecarForm, is_junk};
 
 /// The complete plan for a run.
@@ -63,6 +66,9 @@ pub(crate) struct Candidate {
     pub src: PathBuf,
     pub size: u64,
     pub dev_ino: (u64, u64),
+    /// At extraction; `--delete-duplicates` re-checks it (and, for an
+    /// in-place keeper, the keeper's).
+    pub mtime: Option<SystemTime>,
     pub kind: Kind,
     pub dated: bool,
     pub sidecars: Vec<Sidecar>,
@@ -269,15 +275,24 @@ pub fn build(
         .into_iter()
         .filter_map(|p| crate::fsops::dev_ino(p).ok())
         .collect();
-    let out = OutIndex::build(
-        &cfg.output,
-        WalkSkip {
-            dirs: &skip_dirs,
-            file: cfg.log_file.as_deref(),
-        },
-        &pools.cpu,
-        stop,
-    );
+    // Nothing to place (all filtered, failed, or only orphan sidecars):
+    // no input can be a duplicate or in place, so skip the OUT walk, a
+    // full lstat pass that is slow on a big OUT on an HDD or NAS (hashing
+    // then has no members and reads nothing). Empty
+    // candidates still need it: one hard-linked from OUT is in place.
+    let out = if cands.is_empty() {
+        OutIndex::default()
+    } else {
+        OutIndex::build(
+            &cfg.output,
+            WalkSkip {
+                dirs: &skip_dirs,
+                file: cfg.log_file.as_deref(),
+            },
+            &pools.cpu,
+            stop,
+        )
+    };
     // Hashing reads whole files, so it runs on the io pool: `--io-jobs`
     // bounds concurrent reads and spinning disks or SD cards aren't
     // thrashed (listing and stat above are metadata-only).
@@ -338,12 +353,9 @@ fn into_dup_dir(
         .filter_map(|a| match a {
             Action::Duplicate {
                 src, size, dev_ino, ..
-            } => Some((
-                dup_target(src, &cfg.input, &cfg.duplicates.dir),
-                *size,
-                *dev_ino,
-                src.clone(),
-            )),
+            } => dup_target(src, &cfg.input, &cfg.duplicates.dir)
+                .ok()
+                .map(|t| (t, *size, *dev_ino, src.clone())),
             _ => None,
         })
         .collect();
@@ -422,15 +434,26 @@ fn filed_hash_reps(
 
 /// Where a duplicate goes: `<dupdir>/<src relative to INPUT>`, keeping its
 /// original name and extension case.
-fn dup_target(src: &Path, input: &Path, dup_dir: &Path) -> Target {
-    let rel = src.strip_prefix(input).unwrap_or(src);
+///
+/// Errors when `src` isn't under `input`. Every scanned path is, so this
+/// can't happen today; but joining a non-relative remainder would put the
+/// "duplicates folder" anywhere (an absolute `src` replaces `dup_dir`), so
+/// the file fails instead of being filed next to itself.
+fn dup_target(src: &Path, input: &Path, dup_dir: &Path) -> Result<Target, String> {
+    let rel = src.strip_prefix(input).map_err(|_| {
+        format!(
+            "not filed: {} is outside the input folder {}",
+            src.display(),
+            input.display()
+        )
+    })?;
     let parent = rel.parent().unwrap_or(Path::new(""));
-    Target {
+    Ok(Target {
         dir: dup_dir.join(parent),
         stem: src.file_stem().unwrap_or_default().to_owned(),
         ext: src.extension().map(OsStr::to_owned),
         generated: false,
-    }
+    })
 }
 
 /// Recovers how a sidecar was paired with its media file (as the scan
@@ -485,7 +508,10 @@ pub(crate) fn file_duplicates(actions: Vec<Action>, dd: &DupDir<'_>) -> Vec<Acti
             else {
                 return a;
             };
-            let target = dup_target(&src, dd.input, dd.dir);
+            let target = match dup_target(&src, dd.input, dd.dir) {
+                Ok(t) => t,
+                Err(error) => return Action::Fail { src, error },
+            };
             let hash = dd.hashes.get(&dev_ino).copied();
             let at = dd
                 .check_filed
@@ -515,6 +541,8 @@ pub(crate) fn file_duplicates(actions: Vec<Action>, dd: &DupDir<'_>) -> Vec<Acti
                         src: src.clone(),
                         size,
                         dev_ino,
+                        // Only placed (never deleted), so it needs no mtime.
+                        mtime: None,
                         kind: Kind::Other,
                         dated: false,
                         sidecars,
@@ -636,7 +664,7 @@ pub(crate) fn plan_rmdirs(dirs: &[DirInfo], actions: &[Action], input: &Path) ->
             }
             Action::Duplicate {
                 src,
-                handling: DupHandling::Delete,
+                handling: DupHandling::Delete(_),
                 ..
             } => count_removed(src),
             // Only called for --move, so a filed duplicate leaves the input.
@@ -684,6 +712,7 @@ fn candidate(x: Extracted, cfg: &Config) -> Candidate {
     Candidate {
         size: x.size,
         dev_ino: (x.dev, x.ino),
+        mtime: x.mtime.map(SystemTime::from),
         kind: x.kind,
         dated: x.date.is_some(),
         target,
@@ -761,12 +790,17 @@ fn chain_positions(dir: &Path, name: &Path) -> Vec<(ChainKey, u32)> {
 #[derive(Debug, Clone)]
 enum Keeper {
     /// Rule 1: an existing output file.
-    Existing { path: PathBuf, dev_ino: DevIno },
+    Existing {
+        path: PathBuf,
+        dev_ino: DevIno,
+        mtime: Option<SystemTime>,
+    },
     /// Rule 2: an input already in place; it stays where it is.
     InPlace {
         task: usize,
         src: PathBuf,
         dev_ino: DevIno,
+        mtime: Option<SystemTime>,
     },
     /// Rule 3: the first input of the class, transferred by this run.
     Planned {
@@ -819,6 +853,7 @@ pub(crate) fn resolve(
             let keeper = Keeper::Existing {
                 path: f.path.clone(),
                 dev_ino: f.dev_ino,
+                mtime: f.mtime,
             };
             (k, keeper)
         })
@@ -851,20 +886,25 @@ pub(crate) fn resolve(
             }
             let key = key_of(&c);
             match keepers.get(&key).cloned() {
-                Some(Keeper::Existing { path, dev_ino }) => {
-                    duplicate(c, path, dev_ino, None, policy)
-                }
+                Some(Keeper::Existing {
+                    path,
+                    dev_ino,
+                    mtime,
+                }) => duplicate(c, path, (dev_ino, mtime), None, policy),
                 Some(Keeper::InPlace { task: k, .. }) if k == task => {
                     Action::AlreadyInPlace { src: c.src }
                 }
-                Some(Keeper::InPlace { src, dev_ino, .. }) => {
-                    duplicate(c, src, dev_ino, None, policy)
-                }
+                Some(Keeper::InPlace {
+                    src,
+                    dev_ino,
+                    mtime,
+                    ..
+                }) => duplicate(c, src, (dev_ino, mtime), None, policy),
                 Some(Keeper::Planned {
                     task: k,
                     dst,
                     dev_ino,
-                }) => duplicate(c, dst, dev_ino, Some(k), policy),
+                }) => duplicate(c, dst, (dev_ino, None), Some(k), policy),
                 None => {
                     let dev_ino = c.dev_ino;
                     let action = r.place(c);
@@ -908,6 +948,7 @@ fn in_place_keepers(
             task,
             src: c.src.clone(),
             dev_ino: c.dev_ino,
+            mtime: c.mtime,
         };
         best.entry(key_of(c))
             .and_modify(|cur| {
@@ -998,10 +1039,13 @@ impl Resolver<'_> {
 
 /// A duplicate of `of` under the run's policy. A hard link to `of` is
 /// never deleted: removing it frees nothing and drops a name the user made.
+///
+/// `of_stat` is the keeper's `(dev, ino)` and its mtime at planning (`None`
+/// for a keeper this run creates).
 fn duplicate(
     c: Candidate,
     of: PathBuf,
-    of_dev_ino: DevIno,
+    (of_dev_ino, of_mtime): (DevIno, Option<SystemTime>),
     depends_on: Option<usize>,
     policy: DupPolicy,
 ) -> Action {
@@ -1010,7 +1054,10 @@ fn duplicate(
         // into `File` / `AlreadyFiled` (`file_duplicates`).
         DupPolicy::File | DupPolicy::Skip => DupHandling::Report,
         DupPolicy::Delete if c.dev_ino == of_dev_ino => DupHandling::KeepSameFile,
-        DupPolicy::Delete => DupHandling::Delete,
+        DupPolicy::Delete => DupHandling::Delete(DeleteGuard {
+            src_mtime: c.mtime,
+            of_mtime,
+        }),
     };
     Action::Duplicate {
         of,
@@ -1136,6 +1183,7 @@ mod tests {
             src: PathBuf::from(src),
             size,
             dev_ino: (1, ino),
+            mtime: None,
             kind: Kind::Image,
             dated: true,
             sidecars: vec![],
@@ -1260,7 +1308,11 @@ mod tests {
         let acts = w.resolve(vec![cand("/in/a.jpg", "x", 5, 11)], DupPolicy::Delete);
         assert_eq!(
             dup(&acts[0]),
-            (format!("{OUT}/x.jpg"), None, DupHandling::Delete)
+            (
+                format!("{OUT}/x.jpg"),
+                None,
+                DupHandling::Delete(DeleteGuard::default())
+            )
         );
     }
 
@@ -1514,7 +1566,11 @@ mod tests {
         let acts = w.resolve(vec![cand("/in/a.jpg", "x", 5, 11)], DupPolicy::Delete);
         assert_eq!(
             dup(&acts[0]),
-            (format!("{OUT}/x-3.jpg"), None, DupHandling::Delete)
+            (
+                format!("{OUT}/x-3.jpg"),
+                None,
+                DupHandling::Delete(DeleteGuard::default())
+            )
         );
     }
 
@@ -1729,7 +1785,7 @@ mod tests {
         let deleted = Action::Duplicate {
             src: "/in/e/dup.jpg".into(),
             of: "/out/x/1.jpg".into(),
-            handling: DupHandling::Delete,
+            handling: DupHandling::Delete(DeleteGuard::default()),
             depends_on: Some(0),
             size: 1,
             dev_ino: (1, 1),
@@ -2077,6 +2133,7 @@ mod tests {
                 &forms,
             );
             c.dev_ino = (1, obj.ino);
+            c.mtime = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(i));
             c.target.ext = ext.map(OsString::from);
             c.target.generated = rng.chance(50);
             if rng.chance(20) {
@@ -2123,11 +2180,7 @@ mod tests {
                 in_out,
             });
         }
-        let policy = if rng.chance(50) {
-            DupPolicy::Skip
-        } else {
-            DupPolicy::Delete
-        };
+        let policy = *rng.pick(&[DupPolicy::Skip, DupPolicy::Delete, DupPolicy::File]);
         Case {
             existing,
             cands,
@@ -2200,15 +2253,43 @@ mod tests {
 
     /// The rules of amendment A1, stated directly: pairwise comparison, a
     /// linear search for names.
+    ///
+    /// Naming and the keeper order are restated here too, not borrowed
+    /// from production (`numbered_name`, `sidecar_name`, `order_key`), so a
+    /// bug there can't hide in both sides.
     fn reference(case: &Case) -> Vec<Action> {
         let same = |a: &Obj, b: &Obj| {
             a.ino == b.ino || (a.readable && b.readable && a.cid == b.cid && SIZES[a.cid] > 0)
         };
         let folded = |s: &OsStr| s.to_string_lossy().to_lowercase();
+        // `stem[-n][.ext]`.
+        let name_n = |stem: &OsStr, ext: Option<&OsStr>, n: u32| -> OsString {
+            let mut s = stem.to_string_lossy().into_owned();
+            if n > 1 {
+                s += &format!("-{n}");
+            }
+            if let Some(e) = ext {
+                s += &format!(".{}", e.to_string_lossy());
+            }
+            s.into()
+        };
+        // `(folder, n, name)`: n from a `-<n>` stem suffix (n >= 2, no
+        // leading zero, non-empty base), else 1.
+        let order = |p: &Path| -> (PathBuf, u32, OsString) {
+            let stem = p.file_stem().unwrap().to_string_lossy().into_owned();
+            let n = match stem.rsplit_once('-') {
+                Some((base, d)) if !base.is_empty() && !d.starts_with('0') => {
+                    d.parse::<u32>().ok().filter(|&n| n >= 2).unwrap_or(1)
+                }
+                _ => 1,
+            };
+            let parent = p.parent().unwrap().to_path_buf();
+            (parent, n, p.file_name().unwrap().to_owned())
+        };
         // The existing path in c's own chain holding c's inode, lowest n.
         let chain_holder = |c: &Candidate, o: &Obj| -> Option<PathBuf> {
             (1..=60u32).find_map(|n| {
-                let name = folded(&numbered_name(&c.target.stem, c.target.ext.as_deref(), n));
+                let name = folded(&name_n(&c.target.stem, c.target.ext.as_deref(), n));
                 case.existing
                     .iter()
                     .filter(|e| Path::new(e.dir) == c.target.dir && e.obj.ino == o.ino)
@@ -2224,18 +2305,26 @@ mod tests {
                 .map(Ex::path)
                 .min()
         };
-        let handling = |c: &Obj, keeper: u64| match case.policy {
-            DupPolicy::File | DupPolicy::Skip => DupHandling::Report,
-            DupPolicy::Delete if c.ino == keeper => DupHandling::KeepSameFile,
-            DupPolicy::Delete => DupHandling::Delete,
+        // `keeper`: its inode and plan-time mtime (None for an OUT file
+        // from `insert_file`, or one this run creates).
+        let handling = |c: &Candidate, o: &Obj, keeper: (u64, Option<SystemTime>)| {
+            match case.policy {
+                // Step 4e (filing) is checked separately, in U17's test.
+                DupPolicy::File | DupPolicy::Skip => DupHandling::Report,
+                DupPolicy::Delete if o.ino == keeper.0 => DupHandling::KeepSameFile,
+                DupPolicy::Delete => DupHandling::Delete(DeleteGuard {
+                    src_mtime: c.mtime,
+                    of_mtime: keeper.1,
+                }),
+            }
         };
         let mut planned: Vec<(PathBuf, String)> = Vec::new();
         let mut out: Vec<Action> = Vec::new();
         for (i, (c, o)) in case.cands.iter().enumerate() {
-            let dup = |of: PathBuf, keeper: u64, depends_on| Action::Duplicate {
+            let dup = |of: PathBuf, keeper, depends_on| Action::Duplicate {
                 src: c.src.clone(),
                 of,
-                handling: handling(o, keeper),
+                handling: handling(c, o, keeper),
                 depends_on,
                 size: c.size,
                 dev_ino: c.dev_ino,
@@ -2257,9 +2346,9 @@ mod tests {
                     .existing
                     .iter()
                     .filter(|e| e.in_out && !e.symlink && same(&e.obj, o))
-                    .min_by_key(|e| dedupe::order_key(&e.path()));
+                    .min_by_key(|e| order(&e.path()));
                 if let Some(e) = existing {
-                    out.push(dup(e.path(), e.obj.ino, None));
+                    out.push(dup(e.path(), (e.obj.ino, None), None));
                     continue;
                 }
                 // Rule 2.
@@ -2270,7 +2359,7 @@ mod tests {
                     .filter(|(_, (_, oj))| same(oj, o))
                     .filter_map(|(j, (cj, oj))| {
                         let h = out_holder(oj).or_else(|| chain_holder(cj, oj))?;
-                        Some(((dedupe::order_key(&h), cj.src != h, j), j))
+                        Some(((order(&h), cj.src != h, j), j))
                     })
                     .min();
                 if let Some((_, j)) = in_place_keeper {
@@ -2278,7 +2367,7 @@ mod tests {
                     out.push(if j == i {
                         in_place
                     } else {
-                        dup(cj.src.clone(), oj.ino, None)
+                        dup(cj.src.clone(), (oj.ino, cj.mtime), None)
                     });
                     continue;
                 }
@@ -2290,7 +2379,7 @@ mod tests {
                     let Action::Transfer { dst, .. } = &out[j] else {
                         unreachable!()
                     };
-                    out.push(dup(dst.clone(), case.cands[j].1.ino, Some(j)));
+                    out.push(dup(dst.clone(), (case.cands[j].1.ino, None), Some(j)));
                     continue;
                 }
             }
@@ -2305,12 +2394,19 @@ mod tests {
             };
             let (name, sides) = (1..)
                 .find_map(|n| {
-                    let name = numbered_name(&t.stem, t.ext.as_deref(), n);
-                    let stem_n = numbered_name(&t.stem, None, n);
+                    let name = name_n(&t.stem, t.ext.as_deref(), n);
+                    // The generator's sidecars are all `….xmp`, so generated
+                    // and kept spellings agree.
                     let sides: Vec<OsString> = c
                         .sidecars
                         .iter()
-                        .map(|s| sidecar_name(&name, &stem_n, s, t.generated))
+                        .map(|s| {
+                            let base = match s.form {
+                                SidecarForm::WithExt => name.clone(),
+                                SidecarForm::StemOnly => name_n(&t.stem, None, n),
+                            };
+                            format!("{}.xmp", base.to_string_lossy()).into()
+                        })
                         .collect();
                     let free = !taken(&name, &planned) && !sides.iter().any(|s| taken(s, &planned));
                     free.then_some((name, sides))
@@ -2345,11 +2441,102 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn duplicate_outside_input_fails_instead_of_filing_next_to_itself() {
+        let index = DestIndex::default();
+        let hashes = HashMap::new();
+        let dd = DupDir {
+            input: Path::new("/in"),
+            dir: Path::new("/out/duplicates"),
+            index: &index,
+            hashes: &hashes,
+            check_filed: false,
+        };
+        let dup = Action::Duplicate {
+            src: "/elsewhere/a.jpg".into(),
+            of: "/out/x.jpg".into(),
+            handling: DupHandling::Report,
+            depends_on: None,
+            size: 5,
+            dev_ino: (1, 2),
+            sidecars_left: vec![],
+        };
+        match &file_duplicates(vec![dup], &dd)[0] {
+            Action::Fail { src, error } => {
+                assert_eq!(src, Path::new("/elsewhere/a.jpg"));
+                assert!(error.contains("outside the input folder"), "{error}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// U17, default-policy part: files every report-only duplicate of `acts`
+    /// into a duplicates folder that already holds some names, and checks
+    /// the placement rules directly. Returns how many were filed.
+    fn check_filing(acts: &[Action], seed: u64) -> usize {
+        const DUP: &str = "/out/duplicates";
+        let mut rng = Rng(seed ^ 0x5eed);
+        let pool = ["0.jpg", "0-2.jpg", "1.JPG", "0.xmp", "0.jpg.xmp", "2-2.jpg"];
+        let mut index = DestIndex::default();
+        let mut existing: HashSet<String> = HashSet::new();
+        for name in pool {
+            if rng.chance(40) {
+                index.insert(Path::new(DUP), OsStr::new(name), None);
+                existing.insert(name.to_lowercase());
+            }
+        }
+        let hashes = HashMap::new();
+        let dd = DupDir {
+            input: Path::new("/in"),
+            dir: Path::new(DUP),
+            index: &index,
+            hashes: &hashes,
+            check_filed: false,
+        };
+        let filed = file_duplicates(acts.to_vec(), &dd);
+        let mut names: HashSet<String> = HashSet::new();
+        let mut n = 0;
+        for (before, after) in acts.iter().zip(&filed) {
+            let Action::Duplicate {
+                src,
+                handling: DupHandling::Report,
+                ..
+            } = before
+            else {
+                assert_eq!(before, after, "seed {seed}: only duplicates are filed");
+                continue;
+            };
+            let Action::Duplicate {
+                handling: DupHandling::File { dst, sidecars },
+                sidecars_left,
+                ..
+            } = after
+            else {
+                panic!("seed {seed}: {src:?} not filed: {after:?}");
+            };
+            assert!(sidecars_left.is_empty(), "seed {seed}: sidecars go along");
+            let stem = src.file_stem().unwrap().to_string_lossy().into_owned();
+            let main = dst.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                main.starts_with(&stem),
+                "seed {seed}: keeps its name: {main}"
+            );
+            for p in std::iter::once(dst).chain(sidecars.iter().map(|s| &s.dst)) {
+                assert_eq!(p.parent(), Some(Path::new(DUP)), "seed {seed}");
+                let name = p.file_name().unwrap().to_string_lossy().to_lowercase();
+                assert!(!existing.contains(&name), "seed {seed}: reused {name}");
+                assert!(names.insert(name.clone()), "seed {seed}: {name} twice");
+            }
+            n += 1;
+        }
+        n
+    }
+
     /// U17.
     #[test]
     fn resolver_matches_reference_rule() {
         let pool = one_thread();
-        let mut dups = 0;
+        let (mut dups, mut filed) = (0, 0);
         for seed in 0..3_000 {
             let case = gen_case(seed);
             let got = run_case(&case, &pool, false);
@@ -2359,8 +2546,12 @@ mod tests {
                 .iter()
                 .filter(|a| matches!(a, Action::Duplicate { .. }))
                 .count();
+            if case.policy == DupPolicy::File {
+                filed += check_filing(&got, seed);
+            }
         }
         assert!(dups > 500, "the generator must produce duplicates ({dups})");
+        assert!(filed > 100, "the generator must file duplicates ({filed})");
     }
 
     /// U18.

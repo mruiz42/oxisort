@@ -15,6 +15,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use rayon::prelude::*;
 use walkdir::WalkDir;
@@ -32,6 +33,8 @@ pub struct OutFile {
     pub path: PathBuf,
     pub size: u64,
     pub dev_ino: DevIno,
+    /// Re-checked before `--delete-duplicates` deletes an input copy of it.
+    pub mtime: Option<SystemTime>,
 }
 
 /// Every existing output file that can hold an input's content, plus the
@@ -119,12 +122,13 @@ impl OutIndex {
         index
     }
 
-    /// Adds a regular file (tests and the walk).
+    /// Adds a regular file with no known mtime (tests).
     pub fn insert_file(&mut self, path: impl Into<PathBuf>, size: u64, dev_ino: DevIno) {
         self.files.push(OutFile {
             path: path.into(),
             size,
             dev_ino,
+            mtime: None,
         });
     }
 
@@ -175,6 +179,7 @@ fn stat_out(path: PathBuf, link: bool) -> Option<Stated> {
         Ok(m) if m.is_file() => Some(Stated::File(OutFile {
             size: m.len(),
             dev_ino: (m.dev(), m.ino()),
+            mtime: m.modified().ok(),
             path,
         })),
         Ok(_) => None,

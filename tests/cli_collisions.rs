@@ -814,3 +814,73 @@ fn failed_move_keeps_its_duplicate_out_of_the_dupdir() {
     // Step 5a creates the folder up front; nothing may land in it.
     assert!(common::tree(&env.output.join("duplicates")).is_empty());
 }
+
+/// Review finding L2R1-1: the kept copy in OUT is rewritten in place after
+/// planning with the same size (new bytes, new mtime). The input copy must
+/// survive `--delete-duplicates`.
+#[test]
+fn delete_keeps_source_when_kept_copy_is_rewritten_after_planning() {
+    let env = Env::new();
+    let src = env.add("dto.jpg", "a/copy.jpg");
+    let kept = env.output.join("2017/elsewhere.jpg");
+    fs::create_dir_all(kept.parent().unwrap()).unwrap();
+    fs::copy(common::fixture("dto.jpg"), &kept).unwrap();
+    let cfg = config(&[
+        "--move".as_ref(),
+        "--delete-duplicates".as_ref(),
+        env.input.as_os_str(),
+        env.output.as_os_str(),
+    ]);
+    let pools = oxisort::Pools::new(2, 2).unwrap();
+    let progress = Progress::disabled();
+    let (_, plan) = oxisort::plan_run(&cfg, &pools, &Stop::new(), &progress);
+
+    let mut bytes = fs::read(&kept).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    fs::write(&kept, &bytes).unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    fs::File::options()
+        .write(true)
+        .open(&kept)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+
+    let outcomes = exec::execute(&plan, cfg.mode, &pools.io, &Stop::new(), &progress);
+    assert!(
+        matches!(&outcomes[0], Outcome::Failed(m) if m.contains("changed since planning")),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        fs::read(&src).unwrap(),
+        fs::read(common::fixture("dto.jpg")).unwrap()
+    );
+}
+
+/// Review finding L2R1-3: with nothing to place, OUT isn't walked. The
+/// probe: an unreadable OUT folder is only reported by the walk.
+#[test]
+fn out_walk_is_skipped_when_no_input_can_be_a_duplicate() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    env.add("dto.jpg", "a.jpg");
+    let locked = env.output.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let filtered = env.run(&["--file-type", "video"]);
+    let walked = env.run(&["--dry-run"]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(filtered.status.code(), Some(0), "{}", stderr(&filtered));
+    assert!(
+        !stderr(&filtered).contains("not checked for duplicates"),
+        "{}",
+        stderr(&filtered)
+    );
+    // Control: with a candidate, the walk runs and reports the folder.
+    assert!(
+        stderr(&walked).contains("not checked for duplicates"),
+        "{}",
+        stderr(&walked)
+    );
+}

@@ -97,7 +97,7 @@ Every other copy is handled by one of three mutually exclusive policies:
 |---|---|
 | default | Filed under `OUTPUT/duplicates/<path relative to INPUT>`, original name kept, sidecars with it, in the run's own mode: copied (APFS clone where possible), moved with `-m`, hard-linked with `-l`, symlinked with `-s`. Name clashes there get `-2`, `-3`, …. |
 | `--skip-duplicates` | Reported only (`dup SRC == KEPT`); source and sidecars stay. |
-| `-m --delete-duplicates` | The source is deleted after re-verifying the kept copy; sidecars stay. |
+| `-m --delete-duplicates` | The source is deleted after re-checking that it and the kept copy still have their planned size and modification time (contents are not re-read); sidecars stay. |
 
 - Re-runs don't pile up: in copy, link and symlink runs, a duplicate whose
   content is already in its place in the duplicates folder is reported
@@ -133,8 +133,11 @@ Every other copy is handled by one of three mutually exclusive policies:
   the size, and only then deletes the source.
 - Duplicates are size-checked, then blake3-hashed (equality is decided by the
   full hash). Filing a duplicate never removes it: it is moved or copied with
-  the same no-clobber primitives as any other file. `--delete-duplicates`
-  re-verifies the kept copy right before deleting and never deletes a file
+  the same no-clobber primitives as any other file. Right before deleting,
+  `--delete-duplicates` re-checks that the kept copy is still a regular file
+  with the planned size and modification time (only the size when this run
+  wrote it), and that the source still has its planned size, modification
+  time and inode. Contents are not hashed again. It never deletes a file
   that shares its inode with the kept copy (`(same file, kept)`).
 - Symlinks in the input are not followed. System folders (`.Trashes`,
   `.Spotlight-V100`, `@eaDir`, …) and app libraries (`*.photoslibrary`,
