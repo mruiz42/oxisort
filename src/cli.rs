@@ -128,11 +128,15 @@ pub struct Args {
 
     /// With --move: delete a source file that is a verified duplicate
     /// instead of filing it.
-    #[arg(long, requires = "move_files")]
+    // `requires` alone is met by -l/-s too (they share the `mode` group),
+    // hence the explicit conflicts.
+    #[arg(long, requires = "move_files", conflicts_with_all = ["link", "symlink"])]
     pub delete_duplicates: bool,
 
     /// With --move: remove source folders left empty (ignoring .DS_Store etc.).
-    #[arg(long, requires = "move_files")]
+    // `requires` alone is met by -l/-s too (they share the `mode` group),
+    // hence the explicit conflicts.
+    #[arg(long, requires = "move_files", conflicts_with_all = ["link", "symlink"])]
     pub rmdirs: bool,
 
     /// Threads for metadata reading [default: number of CPUs].
@@ -537,6 +541,13 @@ mod tests {
         use clap::error::ErrorKind::MissingRequiredArgument;
         assert_eq!(kind(&["--delete-duplicates"]), MissingRequiredArgument);
         assert_eq!(kind(&["--rmdirs"]), MissingRequiredArgument);
+        // The modes share one clap group, and a `requires` on a group
+        // member is met by any member, so -l/-s need their own refusal (F3).
+        use clap::error::ErrorKind::ArgumentConflict;
+        for mode in ["-l", "-s"] {
+            assert_eq!(kind(&[mode, "--delete-duplicates"]), ArgumentConflict);
+            assert_eq!(kind(&[mode, "--rmdirs"]), ArgumentConflict);
+        }
         assert!(args(&["--move", "--rmdirs", "--delete-duplicates"]).is_ok());
     }
 

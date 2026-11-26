@@ -336,3 +336,26 @@ fn link_rerun_is_in_place() {
         "{lines:?}"
     );
 }
+
+/// F3: the move-only flags are usage errors with --link/--symlink, and such
+/// a run touches neither INPUT nor OUTPUT.
+#[test]
+fn move_only_flags_refused_with_link_and_symlink() {
+    let env = Env::new();
+    env.add("dto.jpg", "a/dto.jpg");
+    env.add("dto.jpg", "b/renamed_copy.jpg");
+    let before = env.in_tree();
+    for mode in ["-l", "-s"] {
+        for flag in ["--delete-duplicates", "--rmdirs"] {
+            let out = env.run(&[mode, flag]);
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{mode} {flag}: {}",
+                stderr(&out)
+            );
+            assert_eq!(env.in_tree(), before, "{mode} {flag} touched INPUT");
+            assert!(!env.output.exists(), "{mode} {flag} created OUTPUT");
+        }
+    }
+}
