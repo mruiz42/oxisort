@@ -99,7 +99,8 @@ fn log_file_gets_header_lines_and_summary() {
     let out = env.run(&["--quiet", "--log", log.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(0));
     let text = fs::read_to_string(&log).unwrap();
-    assert!(text.contains("INFO  oxisort 0.1.0 run: "), "{text}");
+    let header = format!("INFO  oxisort {} run: ", env!("CARGO_PKG_VERSION"));
+    assert!(text.contains(&header), "{text}");
     assert!(text.contains("INFO  copy "), "{text}");
     assert!(text.contains("transferred:      1"), "{text}");
     // Appends on the next run.

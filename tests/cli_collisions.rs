@@ -605,16 +605,23 @@ fn dupdir_files_are_never_keepers_or_reprocessed() {
     assert_eq!(env.out_tree(), [DST, "duplicates/old/dto.jpg"]);
 
     // Organizing in place never scans the duplicates folder, even when
-    // its name is spelled differently on disk.
+    // its name is spelled differently on disk (where the volume is
+    // case-insensitive, e.g. macOS; elsewhere the canonical spelling).
     let env = Env::new();
     env.add("dto.jpg", "x/one.jpg");
     env.add("dto.jpg", "Duplicates/earlier/two.jpg");
+    let parked = if env.input.join("duplicates").exists() {
+        "Duplicates/earlier/two.jpg"
+    } else {
+        fs::rename(env.input.join("Duplicates"), env.input.join("duplicates")).unwrap();
+        "duplicates/earlier/two.jpg"
+    };
     let first = in_place_cmd(&env, &["--move"]);
     assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
-    assert_eq!(env.in_tree(), [DST, "Duplicates/earlier/two.jpg"]);
+    assert_eq!(env.in_tree(), [DST, parked]);
     let second = in_place_cmd(&env, &["--move"]);
     assert_eq!(second.status.code(), Some(0), "{}", stderr(&second));
-    assert_eq!(env.in_tree(), [DST, "Duplicates/earlier/two.jpg"]);
+    assert_eq!(env.in_tree(), [DST, parked]);
 }
 
 /// I12.

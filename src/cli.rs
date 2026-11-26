@@ -608,7 +608,11 @@ mod tests {
         fs::remove_file(&dups).unwrap();
         fs::create_dir_all(dups.join("sub")).unwrap();
         assert!(check_dup_dir(&dups, &input).is_ok());
-        let inner = root.join("Duplicates/sub"); // another spelling, same folder
+        // Another spelling, same folder, where the volume is case-insensitive.
+        let inner = match root.join("Duplicates/sub") {
+            p if p.exists() => p,
+            _ => dups.join("sub"),
+        };
         assert!(
             check_dup_dir(&dups, &inner)
                 .unwrap_err()

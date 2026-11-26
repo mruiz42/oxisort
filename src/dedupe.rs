@@ -358,8 +358,13 @@ mod tests {
             w(rel);
         }
         std::os::unix::fs::symlink(out.join("2017/a.jpg"), out.join("link.jpg")).unwrap();
-        // Identity, not name: "duplicates" spelled differently on disk.
-        let skip_dirs = [id(&out.join("duplicates")), id(&out.join("import"))];
+        // Identity, not name: "duplicates" spelled differently on disk
+        // (only possible on a case-insensitive volume, e.g. macOS).
+        let dups = match out.join("duplicates") {
+            p if p.exists() => p,
+            _ => out.join("Duplicates"),
+        };
+        let skip_dirs = [id(&dups), id(&out.join("import"))];
         let log = out.join("run.log");
         let idx = OutIndex::build(
             &out,
