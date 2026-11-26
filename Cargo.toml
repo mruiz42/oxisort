@@ -5,7 +5,11 @@ edition = "2024"
 rust-version = "1.85"
 description = "An extremely fast photo and video organizer, written in Rust"
 license = "MIT OR Apache-2.0"
-publish = false
+repository = "https://github.com/mruiz42/oxisort"
+readme = "README.md"
+keywords = ["photo", "video", "exif", "organizer", "cli"]
+categories = ["command-line-utilities", "multimedia"]
+exclude = [".github/"]
 
 [lib]
 name = "oxisort"
