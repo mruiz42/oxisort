@@ -64,8 +64,12 @@ PY
 out="$scratch/bench_out"
 bench "phockup -c 8 (copy, same volume)" 3 "rm -rf '$out'" "phockup '$set_dir' '$out' -c 8"
 bench "oxisort (copy, same volume)" 10 "rm -rf '$out'" "'$oxi' --quiet '$set_dir' '$out'"
+# phockup leaves duplicates in place; oxisort files them by default (one
+# extra clone each). Measure both so the comparison is like for like.
+bench "oxisort --skip-duplicates (copy, same volume)" 10 "rm -rf '$out'" "'$oxi' --quiet --skip-duplicates '$set_dir' '$out'"
 bench "phockup -y -c 8 (dry run)" 3 "rm -rf '$out'" "phockup '$set_dir' '$out' -y -c 8"
 bench "oxisort -n (dry run)" 10 "rm -rf '$out'" "'$oxi' --quiet -n '$set_dir' '$out'"
+bench "oxisort -n --skip-duplicates (dry run)" 10 "rm -rf '$out'" "'$oxi' --quiet -n --skip-duplicates '$set_dir' '$out'"
 
 if [ -n "$external" ]; then
     ext="$external/oxisort_bench_out"

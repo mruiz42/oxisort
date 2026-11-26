@@ -15,8 +15,9 @@ oxisort -n ~/inbox ~/Photos                  # dry run: show what would happen
 Files are named `YYYYMMDD-HHMMSS[subsec].ext` (lowercase extension) from the
 capture date and placed in `OUTPUT/YYYY/MM/DD/`. Files without a date go to
 `OUTPUT/unknown/` with their original name. **Existing files are never
-overwritten**: a different file with the same name gets `-2`, `-3`, …; an
-identical one is reported as a duplicate.
+overwritten**: a different file with the same name gets `-2`, `-3`, …. A file
+whose content already exists (in the input or anywhere under OUTPUT) is a
+duplicate and goes to `OUTPUT/duplicates/` (see [Duplicates](#duplicates)).
 
 ## How a date is chosen
 
@@ -55,22 +56,70 @@ TIFF-structured samples; a parse failure always falls back, never crashes.
 | `--from DATE`, `--to DATE` | Inclusive capture-day range (`YYYY-MM-DD`); undated files pass |
 | `--skip-unknown` | Skip files without a date |
 | `--max-depth N` | `0` = only files directly in INPUT |
-| `--delete-duplicates` | With `--move`: delete a source that is a verified duplicate |
+| `--duplicates-dir NAME` | Folder under OUTPUT that receives duplicates (default `duplicates`) |
+| `--skip-duplicates` | Leave duplicates where they are; only report them |
+| `--delete-duplicates` | With `--move`: delete a source that is a verified duplicate instead of filing it |
 | `--rmdirs` | With `--move`: remove source folders left empty (folders holding only `.DS_Store`, `Thumbs.db`, `desktop.ini`, `._*` count as empty; that junk is deleted and logged) |
 | `-j, --jobs N` | Threads for metadata reading (default: CPU count) |
 | `--io-jobs N` | Parallel file transfers and duplicate hashing, i.e. full-file reads (default 4) |
 | `--progress`, `-q, --quiet`, `-v` | Progress bar / silence / more detail |
 | `--log FILE` | Append a timestamped log of every action and the summary |
 
-Exit codes: `0` ok, `1` some files failed, `2` usage error (nothing touched),
-`3` fatal (output not creatable, internal error), `130` interrupted (Ctrl-C:
-files in flight finish, the rest are reported; a second Ctrl-C exits at once).
+Exit codes: `0` ok, `1` some files failed (or the destination filled up: the
+summary then starts with `stopped: destination full`), `2` usage error
+(nothing touched), `3` fatal (output not creatable, internal error), `130`
+interrupted (Ctrl-C: files in flight finish, the rest are reported; a second
+Ctrl-C exits at once).
 
 ### Spinning disks, SD cards and USB sticks
 
 `--io-jobs 4` suits SSDs. **Use `--io-jobs 1` when the source or destination
 is a hard disk or an SD card/USB stick**: concurrent transfers turn their
 sequential reads into seeks.
+
+## Duplicates
+
+A file is a duplicate when another file has the **same inode, or the same
+size and blake3 hash**. "Another file" is any other input or any existing
+file anywhere under OUTPUT. Names and dates play no part: a re-imported photo
+is found even if it was renamed or got a different date. Empty files are
+never duplicates, and a file that can't be read is never one.
+
+Which copy is kept, per set of identical files:
+1. an existing file under OUTPUT (the first by folder, then `x.jpg` before
+   `x-2.jpg`), so organized files are never displaced;
+2. else a file already in place (organizing in place, or a re-run);
+3. else the first input in sorted order, which is copied/moved as usual.
+
+Every other copy is handled by one of three mutually exclusive policies:
+
+| Policy | What happens |
+|---|---|
+| default | Filed under `OUTPUT/duplicates/<path relative to INPUT>`, original name kept, sidecars with it, in the run's own mode: copied (APFS clone where possible), moved with `-m`, hard-linked with `-l`, symlinked with `-s`. Name clashes there get `-2`, `-3`, …. |
+| `--skip-duplicates` | Reported only (`dup SRC == KEPT`); source and sidecars stay. |
+| `-m --delete-duplicates` | The source is deleted after re-verifying the kept copy; sidecars stay. |
+
+- Re-runs don't pile up: in copy, link and symlink runs, a duplicate whose
+  content is already in its place in the duplicates folder is reported
+  `(already in …)` and nothing is written. The first copy run after
+  re-importing a card that still holds old photos copies each old photo
+  there once.
+- An input that shares its inode with any file under OUTPUT (a second
+  `--link` or `--symlink` run) is `in-place`: nothing is written or deleted.
+- A duplicate is only filed or deleted after the copy it duplicates was
+  written successfully.
+- The duplicates folder is reserved: it is never scanned as input, never
+  used as the kept copy, and never a target of the main tree. `--prefix`,
+  `--no-date-dir` or a date format starting with its name are refused, as is
+  an INPUT inside it, or a `duplicates` entry that is a file or a symlink.
+  Use `--duplicates-dir` if you already have a folder of that name.
+- Organizing in place (`oxisort -m DIR DIR`) also dedupes the library
+  itself: identical organized files beyond the first move to
+  `DIR/duplicates/`. Try it with `-n` first, or use `--skip-duplicates`.
+- Cost: every run lists OUTPUT once (one `lstat` per file, in parallel);
+  files whose size collides with an input are hashed, large ones first by
+  their first and last 64 KiB, so a chance size match costs 128 KiB of reads.
+  `-v` logs `dedupe: N size groups, M partial, K full hashes, X MiB read`.
 
 ## Safety
 
@@ -82,9 +131,11 @@ sequential reads into seeks.
   check-then-rename, with one warning per run. Copies stay fully atomic.
 - A move to another volume copies, `fsync`s (F_FULLFSYNC on macOS), checks
   the size, and only then deletes the source.
-- Duplicates are size-checked, then blake3-hashed. `--delete-duplicates`
+- Duplicates are size-checked, then blake3-hashed (equality is decided by the
+  full hash). Filing a duplicate never removes it: it is moved or copied with
+  the same no-clobber primitives as any other file. `--delete-duplicates`
   re-verifies the kept copy right before deleting and never deletes a file
-  that shares its inode with the kept copy.
+  that shares its inode with the kept copy (`(same file, kept)`).
 - Symlinks in the input are not followed. System folders (`.Trashes`,
   `.Spotlight-V100`, `@eaDir`, …) and app libraries (`*.photoslibrary`,
   `*.lrlibrary`, …) are never entered. The output folder (if inside the
@@ -110,6 +161,7 @@ sequential reads into seeks.
 | `-c, --max-concurrency` | `--io-jobs` (transfers), `--jobs` (metadata) |
 | `--maxdepth` | `--max-depth` |
 | `--output_prefix` / `--output_suffix` | `--prefix` / `--suffix` |
+| duplicates skipped (default) | `--skip-duplicates` (oxisort files them into `OUTPUT/duplicates/` by default) |
 | `--movedel` (needed `--skip-unknown`) | `--delete-duplicates` (no coupling) |
 | `-d, --date` | `-d, --date-format` |
 | `--from-date` / `--to-date` | `--from` / `--to` (old names still accepted) |
@@ -135,6 +187,13 @@ Every difference must be one of these:
     `CreateDate`/`DateTimeOriginal`).
 14. Sub-seconds come from the `SubSecTime*` tag paired with the chosen field,
     also with `-f DateTimeOriginal`.
+15. Duplicates are found by content anywhere (any input, any file under
+    OUTPUT, whatever its name or date) and are filed into
+    `OUTPUT/duplicates/` by default. phockup only compares a file with the
+    one at its own target name, and leaves duplicates where they are. On the
+    fixtures, `fake.arw` is a byte copy of `a.tiff`, so oxisort keeps one
+    (`parity.sh` passes `--skip-duplicates`, so it shows up as phockup's
+    extra `…050607.arw`).
 
 ## Development
 

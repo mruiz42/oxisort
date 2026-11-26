@@ -40,7 +40,9 @@ compare() { # label, extra args...
         printf '<x/>' > "$work/$d/dto.xmp"
     done
     phockup "$work/in_p" "$work/out_p" "$@" >/dev/null 2>&1 || true
-    "$oxisort" --quiet --tz "$tz" "$work/in_o" "$work/out_o" "$@" || true
+    # phockup leaves duplicates in place; compare like with like (README
+    # difference #15 covers oxisort's default duplicates folder).
+    "$oxisort" --quiet --skip-duplicates --tz "$tz" "$work/in_o" "$work/out_o" "$@" || true
     echo "=== $label: phockup (left) vs oxisort (right) ==="
     diff <(listing "$work/out_p") <(listing "$work/out_o") && echo "(identical)" || true
     echo
