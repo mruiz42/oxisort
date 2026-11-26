@@ -6,6 +6,15 @@ oxisort sorts photos, RAW files and videos into date-based folders
 (`YYYY/MM/DD`) and renames them by capture time. It needs no exiftool or
 other runtime dependencies, and it runs multithreaded throughout.
 
+Inspired by [phockup](https://github.com/ivandokov/phockup).
+
+> [!WARNING]
+> **oxisort is beta software.** It moves, renames, links and can delete files.
+> **Always keep a backup of your photos before running it**, and try a dry run
+> (`-n`) first. It is provided as is, with no warranty, and the authors accept
+> no responsibility for lost, damaged or misplaced files. See
+> [Disclaimer](#disclaimer).
+
 ```
 oxisort [OPTIONS] <INPUT> <OUTPUT>
 
@@ -169,6 +178,22 @@ scripts/gen-bench.sh /tmp/set 1200           # synthetic benchmark library
 
 Platforms: macOS is the verified target. The Linux code paths are written but
 not yet run in CI; Windows doesn't build yet.
+
+## Disclaimer
+
+oxisort is **beta software** and is still under active development. Its
+behavior, options and output layout may change between versions.
+
+- **Keep a backup.** Before running oxisort on files you care about, make sure
+  you have a complete, verified backup of them somewhere else. Run a dry run
+  (`-n`) first and read what it plans to do.
+- **No warranty.** oxisort is provided "as is", without warranty of any kind,
+  express or implied, including fitness for a particular purpose. See the
+  [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE) licenses for the full
+  terms.
+- **No liability.** You use oxisort entirely at your own risk. The authors and
+  contributors accept no responsibility for any loss, damage, corruption,
+  misplacement or deletion of files, or for any other consequence of using it.
 
 ## License
 
