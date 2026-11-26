@@ -10,9 +10,9 @@ use regex::Regex;
 use crate::metadata::RawMeta;
 use crate::model::{Captured, DateField, DateSource, Kind, Zone};
 
-/// Default filename pattern. Slightly broader than phockup's: it also matches
-/// `20160915_123456.jpg` with no prefix, and limits years to 1900–2099 to
-/// avoid false matches on long digit runs.
+/// Default filename pattern. It also matches `20160915_123456.jpg` with no
+/// prefix, and limits years to 1900–2099 to avoid false matches on long
+/// digit runs.
 pub const DEFAULT_REGEX: &str = r"(?:^|\D)(?P<year>(?:19|20)\d{2})(?P<month>\d{2})(?P<day>\d{2})[_-]?(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})";
 
 /// The earliest container date accepted. `mvhd = 0` decodes to 1904 and
@@ -116,7 +116,7 @@ fn parse_offset(s: &str) -> Option<FixedOffset> {
 /// Accepts `:` or `-` between date parts, a space or `T` before the time, an
 /// optional `.digits` fraction, and an optional `Z` / `±HH:MM` / `±HHMM`
 /// suffix. The suffix is parsed but **not applied**: the result is the wall
-/// clock as written (this is what fixes phockup's MKV `Z` failure).
+/// clock as written (so MKV dates ending in `Z` parse).
 /// Empty, all-separator and `0000…` values are rejected.
 pub fn parse_datestring(raw: &str) -> Option<(NaiveDateTime, Option<String>)> {
     let s = raw.trim_matches(|c: char| c == ' ' || c == '\0');

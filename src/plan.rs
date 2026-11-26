@@ -1122,8 +1122,8 @@ pub(crate) fn numbered_name(stem: &OsStr, ext: Option<&OsStr>, n: u32) -> OsStri
     name
 }
 
-/// Target name of a sidecar, derived from the final main name (fixes
-/// phockup's `….jpg-2.xmp`): `name.ext.xmp` → `<main name>.xmp`,
+/// Target name of a sidecar, derived from the final main name (so a
+/// collision gives `x-2.jpg.xmp`, not `x.jpg-2.xmp`): `name.ext.xmp` → `<main name>.xmp`,
 /// `name.xmp` → `<main stem>.xmp`. Generated names use a lowercase `.xmp`;
 /// kept names keep the sidecar's own spelling.
 pub(crate) fn sidecar_name(

@@ -1,8 +1,10 @@
 # oxisort
 
-Sort photos and videos into date-based folders, fast. A pure-Rust redesign
-inspired by [phockup](https://github.com/ivandokov/phockup): same output
-layout and naming, no exiftool at runtime, and multithreaded throughout.
+An extremely fast photo and video organizer, written in Rust.
+
+oxisort sorts photos, RAW files and videos into date-based folders
+(`YYYY/MM/DD`) and renames them by capture time. It needs no exiftool or
+other runtime dependencies, and it runs multithreaded throughout.
 
 ```
 oxisort [OPTIONS] <INPUT> <OUTPUT>
@@ -156,48 +158,6 @@ Every other copy is handled by one of three mutually exclusive policies:
   UTC `mvhd` date and gets converted with the zone. Hostile files can make the
   metadata parser allocate up to 1 GiB per thread.
 
-## Coming from phockup
-
-| phockup | oxisort |
-|---|---|
-| `-y, --dry-run` | `-n, --dry-run` |
-| `-c, --max-concurrency` | `--io-jobs` (transfers), `--jobs` (metadata) |
-| `--maxdepth` | `--max-depth` |
-| `--output_prefix` / `--output_suffix` | `--prefix` / `--suffix` |
-| duplicates skipped (default) | `--skip-duplicates` (oxisort files them into `OUTPUT/duplicates/` by default) |
-| `--movedel` (needed `--skip-unknown`) | `--delete-duplicates` (no coupling) |
-| `-d, --date` | `-d, --date-format` |
-| `--from-date` / `--to-date` | `--from` / `--to` (old names still accepted) |
-
-### Differences from phockup (by design)
-
-`scripts/parity.sh` runs both tools on the fixtures and diffs the trees.
-Every difference must be one of these:
-
-1. `DateTimeOriginal` wins over `CreateDate` when they differ.
-2. Videos are named by local wall clock, not UTC.
-3. MKV dates ending in `Z` are parsed instead of going to `unknown`.
-4. The XMP collision suffix goes before `.xmp` (`x-2.jpg.xmp`, not `x.jpg-2.xmp`).
-5. `._*`, `desktop.ini` and system folders are ignored.
-6. No maker-note TimeZone shift.
-7. Undated media keep their name verbatim (phockup lowercases it).
-8. `.XMP` is treated as a sidecar.
-9. The default regex also matches `YYYYMMDD_HHMMSS` with no prefix.
-10. Dry-run detects collisions within the input.
-11. `--delete-duplicates` and `--rmdirs` are never forced on.
-12. ORF/RW2 EXIF isn't read (phockup reads it through exiftool).
-13. `ModifyDate` is a default fallback (phockup's default fields stop at
-    `CreateDate`/`DateTimeOriginal`).
-14. Sub-seconds come from the `SubSecTime*` tag paired with the chosen field,
-    also with `-f DateTimeOriginal`.
-15. Duplicates are found by content anywhere (any input, any file under
-    OUTPUT, whatever its name or date) and are filed into
-    `OUTPUT/duplicates/` by default. phockup only compares a file with the
-    one at its own target name, and leaves duplicates where they are. On the
-    fixtures, `fake.arw` is a byte copy of `a.tiff`, so oxisort keeps one
-    (`parity.sh` passes `--skip-duplicates`, so it shows up as phockup's
-    extra `…050607.arw`).
-
 ## Development
 
 ```
@@ -205,8 +165,6 @@ cargo test                                   # unit + integration tests
 cargo clippy --all-targets -- -D warnings
 scripts/gen-fixtures.sh                      # regenerate tests/fixtures (exiftool, ffmpeg, sips)
 scripts/gen-bench.sh /tmp/set 1200           # synthetic benchmark library
-scripts/bench.sh /tmp/set /tmp/scratch [/Volumes/SSD/dir]
-scripts/parity.sh                            # phockup vs oxisort on the fixtures
 ```
 
 Platforms: macOS is the verified target. The Linux code paths are written but

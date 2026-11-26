@@ -1,7 +1,7 @@
-//! `--date-format` (`-d`): a small tokenizer that turns phockup-style formats
-//! such as `YYYY/MM/DD` into folder paths.
+//! `--date-format` (`-d`): a small tokenizer that turns formats such as
+//! `YYYY/MM/DD` into folder paths.
 //!
-//! phockup does chained `str.replace`, so literal words get mangled
+//! Chained string replacement would mangle literal words
 //! (`YYYY-MM Month` → `2011-07 Julyonth`). Here each maximal run of ASCII
 //! letters is either split *entirely* into tokens (greedy, longest first) or
 //! kept as a literal, so `Month` stays `Month` while `YYYYMMDD` still works.
