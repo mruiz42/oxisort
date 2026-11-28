@@ -10,6 +10,10 @@ All notable changes to oxisort are recorded here. The format follows
 - Linux release binaries are now static musl builds for x86_64 and aarch64,
   replacing the glibc builds. They run on any Linux, including older
   distributions and Alpine.
+- Copy, link and symlink modes refuse an OUTPUT that is the INPUT folder
+  (compared by identity, so symlinks and other spellings are caught) and
+  exit 2 before touching anything. They used to add a sorted second copy of
+  the input to itself. `-m` still organizes a folder in place.
 
 ### Added
 - Capture dates are read from Olympus ORF and Panasonic RW2 raw files

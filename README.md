@@ -155,8 +155,9 @@ Every other copy is handled by one of three mutually exclusive policies:
 - Symlinks in the input are not followed. System folders (`.Trashes`,
   `.Spotlight-V100`, `@eaDir`, …) and app libraries (`*.photoslibrary`,
   `*.lrlibrary`, …) are never entered. The output folder (if inside the
-  input) and the `--log` file are excluded. INPUT may equal OUTPUT (organize
-  in place).
+  input) and the `--log` file are excluded. INPUT may equal OUTPUT only with
+  `-m` (organize in place); copy, link and symlink modes refuse it (exit 2),
+  however the same folder is spelled.
 - Copies close their destination explicitly and fail (removing the partial
   file) if `close` reports an error, which is where network filesystems
   (SMB/NFS) surface delayed write errors.
