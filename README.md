@@ -1,5 +1,9 @@
 # oxisort
 
+[![CI](https://github.com/mruiz42/oxisort/actions/workflows/ci.yml/badge.svg)](https://github.com/mruiz42/oxisort/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/oxisort.svg)](https://crates.io/crates/oxisort)
+[![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/oxisort.svg)](#license)
+
 An extremely fast photo and video organizer, written in Rust.
 
 oxisort sorts photos, RAW files and videos into date-based folders
