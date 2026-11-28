@@ -80,6 +80,11 @@ const ALL_FIXTURES: &[&str] = &[
     "mvhd_only.mp4",
     "nodate.mp4",
     "notes.txt",
+    "olympus_c5060wz.orf",
+    "olympus_e3.orf",
+    "olympus_tg5.orf",
+    "panasonic_gh5s.rw2",
+    "panasonic_lx7.rw2",
     "sr2_far_data.arw",
     "zero_date.jpg",
 ];
@@ -96,11 +101,16 @@ fn every_fixture_lands_in_the_right_place() {
         env.out_tree(),
         [
             // Sorted input order: "2…" before "I…", so the bare name wins.
+            "2006/04/14/20060414-084834.orf", // Olympus IIRS (real, truncated)
+            "2008/03/09/20080309-082253.orf", // Olympus IIRO
             "2016/09/15/20160915-123456-2.jpg",
             "2016/09/15/20160915-123456.jpg",
             "2017/01/02/20170102-030405123.jpg", // DTO + subsec, offset ignored
+            "2017/09/10/20170910-154342.orf",    // Olympus IIRO (TG-5)
+            "2017/10/03/20171003-144309.rw2",    // Panasonic IIU\0
             "2018/02/03/20180203-040506.jpg",    // CreateDate only
             "2018/03/04/20180304-050607.jpg",    // ModifyDate only
+            "2018/05/23/20180523-132343780.rw2", // RW2 with SubSecTimeOriginal
             "2019/03/04/20190304-050607.heic",
             "2019/03/04/20190304-050607.png",
             "2019/03/04/20190304-050607.tiff",
@@ -111,7 +121,7 @@ fn every_fixture_lands_in_the_right_place() {
             "2023/01/02/20230102-030405.webp",
             "2026/01/02/20260102-061139705.arw", // nom-exif fails: tiffdate
             "duplicates/fake.arw",               // byte copy of a.tiff, original name kept
-            "unknown/a.orf",                     // no EXIF read for ORF (decision Q7)
+            "unknown/a.orf",                     // IIRO header, empty IFD0: no date
             "unknown/base.jpg",
             "unknown/nodate.mp4", // mvhd = 0 → 1904 → no date
             "unknown/notes.txt",
@@ -137,7 +147,7 @@ fn every_fixture_lands_in_the_right_place() {
         stdout(&out)
     );
     let err = stderr(&out);
-    assert!(err.contains("(images 13, videos 5, other 1)"), "{err}");
+    assert!(err.contains("(images 18, videos 5, other 1)"), "{err}");
     assert!(
         err.contains("duplicates:       1 (copied to duplicates/: 1)"),
         "{err}"

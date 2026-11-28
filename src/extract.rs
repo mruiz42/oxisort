@@ -98,7 +98,7 @@ pub fn extract_one(
     let path: &Path = &entry.path;
     let ext = path.extension().and_then(|e| e.to_str());
     let class = classify::classify(&header, ext);
-    let raw = if class.kind == Kind::Other || classify::is_unreadable_raw(ext) {
+    let raw = if class.kind == Kind::Other {
         RawMeta::default()
     } else {
         metadata::read(parser, path, file, class.mime)

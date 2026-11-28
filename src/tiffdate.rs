@@ -1,8 +1,8 @@
 //! A minimal TIFF date reader: IFD0 → ExifIFD, the three date tags and
 //! their sub-seconds, nothing else.
 //!
-//! It is the fallback for TIFF-based files (ARW, NEF, DNG, CR2, TIFF …) when
-//! nom-exif fails. nom-exif walks *every* IFD0 entry and gives up on the
+//! It is the fallback for TIFF-based files (ARW, NEF, DNG, CR2, ORF, RW2,
+//! TIFF …) when nom-exif fails (it doesn't know the ORF/RW2 magics at all). nom-exif walks *every* IFD0 entry and gives up on the
 //! whole file as soon as one entry's data lies past what it has buffered
 //! (seen on the Sony A7C II, whose IFD0 points at a large block far into the
 //! file). This reader follows only the pointers it needs and reads a few
@@ -36,15 +36,18 @@ const MAX_ASCII: u32 = 64;
 /// like the other readers in `metadata`.
 ///
 /// # Errors
-/// When `r` isn't TIFF (`II*\0` / `MM\0*`) or its IFD0 can't be read. A
+/// When `r` isn't TIFF-shaped (`II*\0`, `MM\0*`, or the ORF/RW2 variants
+/// `IIRO`, `IIRS`, `MMOR`, `IIU\0`) or its IFD0 can't be read. A
 /// missing or unreadable ExifIFD or tag just leaves that date `None`.
 pub fn read(r: &mut (impl Read + Seek)) -> Result<[Option<ExifStamp>; 3], String> {
     let mut head = [0u8; 8];
     r.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     r.read_exact(&mut head).map_err(|e| e.to_string())?;
     let le = match &head[..4] {
-        b"II*\0" => true,
-        b"MM\0*" => false,
+        // Standard TIFF, Olympus ORF (IIRO, IIRS, MMOR) and Panasonic RW2
+        // (IIU\0): the same IFD structure behind a vendor magic.
+        b"II*\0" | b"IIRO" | b"IIRS" | b"IIU\0" => true,
+        b"MM\0*" | b"MMOR" => false,
         _ => return Err("not a TIFF header".to_owned()),
     };
     let t = Tiff { le };
@@ -158,33 +161,75 @@ mod tests {
 
     use super::*;
 
-    /// A big-endian TIFF: IFD0 { ExifIFD } → ExifIFD { DateTimeOriginal,
-    /// SubSecTimeOriginal "42" inline }.
-    fn big_endian() -> Vec<u8> {
-        let mut b = b"MM\0*".to_vec();
-        b.extend(8u32.to_be_bytes());
-        // IFD0 @8: 1 entry, next = 0.
-        b.extend(1u16.to_be_bytes());
-        b.extend(EXIF_IFD.to_be_bytes());
-        b.extend(LONG.to_be_bytes());
-        b.extend(1u32.to_be_bytes());
-        b.extend(26u32.to_be_bytes());
-        b.extend(0u32.to_be_bytes());
-        // ExifIFD @26: 2 entries, next = 0, then the date at 56.
-        b.extend(2u16.to_be_bytes());
+    /// Builds a TIFF-shaped file with the given 4-byte magic and byte order:
+    /// IFD0 at `ifd0_at` holding `pad_entries` filler entries and then the
+    /// ExifIFD pointer as its *last* entry (the RW2 layout), and an ExifIFD
+    /// { DateTimeOriginal, SubSecTimeOriginal "42" inline }.
+    fn tiff(magic: &[u8; 4], le: bool, ifd0_at: u32, pad_entries: u16) -> Vec<u8> {
+        let u16b = |v: u16| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+        let u32b = |v: u32| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+        let mut b = magic.to_vec();
+        b.extend(u32b(ifd0_at));
+        b.resize(ifd0_at as usize, 0);
+        let entries = pad_entries + 1;
+        let exif_at = ifd0_at + 2 + 12 * u32::from(entries) + 4;
+        b.extend(u16b(entries));
+        for i in 0..pad_entries {
+            // A harmless SHORT tag the reader must skip over.
+            b.extend(u16b(0x0001 + i));
+            b.extend(u16b(3));
+            b.extend(u32b(1));
+            b.extend(u32b(0));
+        }
+        b.extend(u16b(EXIF_IFD));
+        b.extend(u16b(LONG));
+        b.extend(u32b(1));
+        b.extend(u32b(exif_at));
+        b.extend(u32b(0));
+        assert_eq!(b.len() as u32, exif_at);
+        let date_at = exif_at + 2 + 2 * 12 + 4;
+        b.extend(u16b(2));
         for (tag, count, value) in [
-            (DATE_TIME_ORIGINAL, 20u32, 56u32.to_be_bytes()),
+            (DATE_TIME_ORIGINAL, 20u32, u32b(date_at)),
             (SUBSEC_ORIGINAL, 3, *b"42\0\0"),
         ] {
-            b.extend(tag.to_be_bytes());
-            b.extend(ASCII.to_be_bytes());
-            b.extend(count.to_be_bytes());
+            b.extend(u16b(tag));
+            b.extend(u16b(ASCII));
+            b.extend(u32b(count));
             b.extend(value);
         }
-        b.extend(0u32.to_be_bytes());
-        assert_eq!(b.len(), 56);
+        b.extend(u32b(0));
+        assert_eq!(b.len() as u32, date_at);
         b.extend(b"2001:02:03 04:05:06\0");
         b
+    }
+
+    fn big_endian() -> Vec<u8> {
+        tiff(b"MM\0*", false, 8, 0)
+    }
+
+    fn assert_dto(bytes: Vec<u8>) {
+        let got = read(&mut Cursor::new(bytes)).unwrap();
+        let dto = got[0].as_ref().unwrap();
+        assert_eq!(dto.wall.to_string(), "2001-02-03 04:05:06");
+        assert_eq!(dto.subsec.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn reads_raw_variant_magics() {
+        // Olympus ORF (IIRO, IIRS), and the big-endian MMOR variant.
+        assert_dto(tiff(b"IIRO", true, 8, 0));
+        assert_dto(tiff(b"IIRS", true, 8, 0));
+        assert_dto(tiff(b"MMOR", false, 8, 0));
+        // Panasonic RW2: IFD0 at 24, ExifIFD pointer as the last entry.
+        assert_dto(tiff(b"IIU\0", true, 24, 5));
+        assert_dto(tiff(b"II*\0", true, 8, 3));
+    }
+
+    #[test]
+    fn rejects_unknown_magic() {
+        assert!(read(&mut Cursor::new(tiff(b"IIXX", true, 8, 0))).is_err());
+        assert!(read(&mut Cursor::new(tiff(b"MMXX", false, 8, 0))).is_err());
     }
 
     #[test]

@@ -48,10 +48,8 @@ duplicate and goes to `OUTPUT/duplicates/` (see [Duplicates](#duplicates)).
 3. With `--timestamp`, the file's modification time.
 
 Supported for metadata: JPEG, HEIC/HEIF, AVIF, PNG, WebP, TIFF and TIFF-based
-RAW (ARW, NEF, CR2, DNG, PEF, …), CR3, RAF, MOV/MP4/M4V/3GP, MKV/WebM.
-**ORF and RW2 are recognised as images but their EXIF is not read** (neither
-Rust metadata crate supports their header); they fall back to the filename,
-`--timestamp`, or `unknown/`. Real Sony ARW files were only tested via
+RAW (ARW, NEF, CR2, DNG, PEF, ORF, RW2, …), CR3, RAF, MOV/MP4/M4V/3GP,
+MKV/WebM. Real Sony ARW files were only tested via
 TIFF-structured samples; a parse failure always falls back, never crashes.
 
 ## Options
