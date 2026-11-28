@@ -58,12 +58,6 @@ pub fn kind_from_ext(ext: Option<&str>) -> Kind {
     }
 }
 
-/// ORF and RW2 use a non-standard TIFF magic that neither metadata crate
-/// reads (decision Q7), so we don't try.
-pub fn is_unreadable_raw(ext: Option<&str>) -> bool {
-    ext.is_some_and(|e| e.eq_ignore_ascii_case("orf") || e.eq_ignore_ascii_case("rw2"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,13 +80,5 @@ mod tests {
         assert_eq!(classify(unknown, Some("3GP")).kind, Kind::Video);
         assert_eq!(classify(unknown, Some("txt")).kind, Kind::Other);
         assert_eq!(classify(unknown, None).kind, Kind::Other);
-    }
-
-    #[test]
-    fn unreadable_raw() {
-        assert!(is_unreadable_raw(Some("ORF")));
-        assert!(is_unreadable_raw(Some("rw2")));
-        assert!(!is_unreadable_raw(Some("arw")));
-        assert!(!is_unreadable_raw(None));
     }
 }

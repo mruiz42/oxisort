@@ -34,8 +34,14 @@ pub struct RunSummary {
     pub skipped_unknown: usize,
     pub scan: ScanCounts,
     pub shared_sidecars: usize,
+    /// `.oxisort-tmp-*` files from an interrupted run (input and output).
+    pub leftovers: usize,
     pub dirs_removed: usize,
     pub junk_removed: usize,
+    /// Files blake3-verified before a source was deleted.
+    pub verified: usize,
+    /// `--no-verify` was given.
+    pub verify_skipped: bool,
     /// `path: message` for every failure (files, sidecars, scan errors).
     pub errors: Vec<String>,
     pub not_run: usize,
@@ -180,7 +186,7 @@ impl RunSummary {
         let _ = writeln!(
             s,
             "  skipped:          type {}, date range {}, unknown {}, ignored {}, symlinks {}, \
-             system folders {}, orphan sidecars {}, shared sidecars {}",
+             system folders {}, orphan sidecars {}, shared sidecars {}, leftover temp files {}",
             self.skipped_type,
             self.skipped_range,
             self.skipped_unknown,
@@ -188,13 +194,23 @@ impl RunSummary {
             c.symlinks,
             c.skipped_dirs,
             c.orphan_sidecars,
-            self.shared_sidecars
+            self.shared_sidecars,
+            self.leftovers
         );
         if self.dirs_removed > 0 || self.junk_removed > 0 {
             let _ = writeln!(
                 s,
                 "  folders removed:  {} (junk files removed {})",
                 self.dirs_removed, self.junk_removed
+            );
+        }
+        if self.verify_skipped {
+            let _ = writeln!(s, "  verification:     skipped (--no-verify)");
+        } else if self.verified > 0 {
+            let _ = writeln!(
+                s,
+                "  verification:     {} files checked (blake3)",
+                self.verified
             );
         }
         let _ = writeln!(s, "  errors:           {}", self.errors.len());

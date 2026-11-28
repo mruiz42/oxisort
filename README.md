@@ -1,5 +1,9 @@
 # oxisort
 
+[![CI](https://github.com/mruiz42/oxisort/actions/workflows/ci.yml/badge.svg)](https://github.com/mruiz42/oxisort/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/oxisort.svg)](https://crates.io/crates/oxisort)
+[![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/oxisort.svg)](#license)
+
 An extremely fast photo and video organizer, written in Rust.
 
 oxisort sorts photos, RAW files and videos into date-based folders
@@ -44,10 +48,8 @@ duplicate and goes to `OUTPUT/duplicates/` (see [Duplicates](#duplicates)).
 3. With `--timestamp`, the file's modification time.
 
 Supported for metadata: JPEG, HEIC/HEIF, AVIF, PNG, WebP, TIFF and TIFF-based
-RAW (ARW, NEF, CR2, DNG, PEF, …), CR3, RAF, MOV/MP4/M4V/3GP, MKV/WebM.
-**ORF and RW2 are recognised as images but their EXIF is not read** (neither
-Rust metadata crate supports their header); they fall back to the filename,
-`--timestamp`, or `unknown/`. Real Sony ARW files were only tested via
+RAW (ARW, NEF, CR2, DNG, PEF, ORF, RW2, …), CR3, RAF, MOV/MP4/M4V/3GP,
+MKV/WebM. Real Sony ARW files were only tested via
 TIFF-structured samples; a parse failure always falls back, never crashes.
 
 ## Options
@@ -134,27 +136,51 @@ Every other copy is handled by one of three mutually exclusive policies:
 
 ## Safety
 
-- Every destination write is exclusive: APFS clone or `O_EXCL` create for
-  copies, `renamex_np(RENAME_EXCL)` (macOS) / `renameat2(RENAME_NOREPLACE)`
-  (Linux) for moves. A file that appears at a planned name after planning is
-  reported, never overwritten.
-- **exFAT** (and other volumes without an atomic no-replace rename): moves use
-  check-then-rename, with one warning per run. Copies stay fully atomic.
-- A move to another volume copies, `fsync`s (F_FULLFSYNC on macOS), checks
-  the size, and only then deletes the source.
+- Every destination write is exclusive: an APFS clone, or a no-replace
+  rename (`renamex_np(RENAME_EXCL)` on macOS, `renameat2(RENAME_NOREPLACE)` on
+  Linux). A file that appears at a planned name after planning is reported,
+  never overwritten.
+- **Crash-safe copies.** A data copy (no clone possible) is written to a
+  hidden `.oxisort-tmp-*` file in the target folder and renamed to its final
+  name only once complete. A crash or `kill -9` never leaves a partial file
+  under a real name. Leftover temp files are skipped by later runs and listed
+  in one warning with their paths; oxisort never deletes them, so remove them
+  by hand.
+- `--durable` also fsyncs every file (F_FULLFSYNC on macOS) before it gets
+  its name, and the folder holding it, so a power cut can't lose a file the
+  run reported as done. It is off by default because it is slow: 3-15x for
+  photo-sized copies on an internal SSD.
+- **exFAT** (and other volumes without an atomic no-replace rename): moves and
+  copies claim their final name with check-then-rename, with one warning per
+  run. On exFAT, macOS also writes an AppleDouble `._.oxisort-tmp-*` twin next
+  to a temp file; it is ignored like any other `._` file.
+- A move to another volume copies to a temp name, `fsync`s it (F_FULLFSYNC on
+  macOS), checks the size, **re-reads the copy from the device and compares
+  its blake3 with the source's**, renames it into place, and only then deletes
+  the source. A mismatch keeps the source and fails that file (exit 1).
+- **Verification.** No source is deleted until its copy is proven identical
+  by blake3: cross-volume moves (above) and `--delete-duplicates` (both files
+  are re-hashed right before the delete and must match the hash planning
+  found). Same-volume moves are renames and need no check. Measured cost on
+  this Mac (APFS disk image as the target): a cross-volume move of 200 × 3 MB
+  files took 7.4 s instead of 5.9 s (+26%); `--delete-duplicates` of 100
+  pairs took 1.59 s instead of 1.47 s. `--no-verify` skips the re-read and
+  keeps only the size and modification-time checks; the summary then says
+  `verification: skipped (--no-verify)`.
 - Duplicates are size-checked, then blake3-hashed (equality is decided by the
   full hash). Filing a duplicate never removes it: it is moved or copied with
   the same no-clobber primitives as any other file. Right before deleting,
   `--delete-duplicates` re-checks that the kept copy is still a regular file
   with the planned size and modification time (only the size when this run
   wrote it), and that the source still has its planned size, modification
-  time and inode. Contents are not hashed again. It never deletes a file
-  that shares its inode with the kept copy (`(same file, kept)`).
+  time and inode, then re-hashes both (see Verification). It never deletes a
+  file that shares its inode with the kept copy (`(same file, kept)`).
 - Symlinks in the input are not followed. System folders (`.Trashes`,
   `.Spotlight-V100`, `@eaDir`, …) and app libraries (`*.photoslibrary`,
   `*.lrlibrary`, …) are never entered. The output folder (if inside the
-  input) and the `--log` file are excluded. INPUT may equal OUTPUT (organize
-  in place).
+  input) and the `--log` file are excluded. INPUT may equal OUTPUT only with
+  `-m` (organize in place); copy, link and symlink modes refuse it (exit 2),
+  however the same folder is spelled.
 - Copies close their destination explicitly and fail (removing the partial
   file) if `close` reports an error, which is where network filesystems
   (SMB/NFS) surface delayed write errors.

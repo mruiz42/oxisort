@@ -139,6 +139,16 @@ pub struct Args {
     #[arg(long, requires = "move_files", conflicts_with_all = ["link", "symlink"])]
     pub rmdirs: bool,
 
+    /// Skip the blake3 re-read before deleting a source (cross-device
+    /// moves, --delete-duplicates); only sizes and mtimes are checked.
+    #[arg(long)]
+    pub no_verify: bool,
+
+    /// fsync every file and its folder before moving on: survives a power
+    /// cut, but is much slower (3-15x for photo-sized copies).
+    #[arg(long)]
+    pub durable: bool,
+
     /// Threads for metadata reading [default: number of CPUs].
     #[arg(short = 'j', long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=512))]
     pub jobs: Option<u16>,
@@ -242,6 +252,7 @@ impl Args {
 
         let input = canonical_input(&self.input)?;
         let output = resolve_output(&self.output)?;
+        check_not_same_folder(&input, &output, mode)?;
         if mode == Mode::HardLink {
             let in_dev = dev_of(&input)?;
             let out_dev = dev_of(&nearest_existing(&output))?;
@@ -290,6 +301,8 @@ impl Args {
                 dir: dup_dir,
             },
             rmdirs: self.rmdirs,
+            durable: self.durable,
+            verify: !self.no_verify,
             jobs,
             io_jobs: usize::from(self.io_jobs),
             verbosity,
@@ -498,6 +511,36 @@ fn dev_of(path: &Path) -> Result<u64, UsageError> {
     fs::metadata(path)
         .map(|m| m.dev())
         .map_err(|e| usage(format!("{}: {e}", path.display())))
+}
+
+/// Copy, link and symlink modes add files to OUTPUT and keep the sources, so
+/// OUTPUT == INPUT would grow the input with a second, sorted copy of itself
+/// (release test F7). Folders are compared by `(dev, ino)`, so any spelling
+/// of the same folder (symlink, case, Unicode form, `.`/`..`, bind mount) is
+/// caught. `-m` organizes in place and stays allowed. A missing OUTPUT can't
+/// be INPUT.
+fn check_not_same_folder(input: &Path, output: &Path, mode: Mode) -> Result<(), UsageError> {
+    if mode == Mode::Move {
+        return Ok(());
+    }
+    let Ok(out_meta) = fs::metadata(output) else {
+        return Ok(());
+    };
+    let in_meta =
+        fs::metadata(input).map_err(|e| usage(format!("input {}: {e}", input.display())))?;
+    if (out_meta.dev(), out_meta.ino()) == (in_meta.dev(), in_meta.ino()) {
+        let verb = match mode {
+            Mode::HardLink => "link",
+            Mode::Symlink => "symlink",
+            _ => "copy",
+        };
+        return Err(usage(format!(
+            "output {} is the input folder: {verb} mode would add files to it \
+             (use -m to organize a folder in place)",
+            output.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Hard links can't cross volumes; reject that before touching anything.
@@ -711,6 +754,28 @@ mod tests {
             .unwrap()
             .into_config();
         assert!(out_is_file.unwrap_err().0.contains("not a folder"));
+    }
+
+    /// F7: OUTPUT == INPUT is refused for copy, link and symlink, by
+    /// identity, and allowed for move or a missing OUTPUT.
+    #[test]
+    fn same_folder_refused_except_for_move() {
+        let d = tempfile::tempdir().unwrap();
+        let input = fs::canonicalize(d.path()).unwrap().join("in");
+        fs::create_dir(&input).unwrap();
+        let alias = d.path().join("alias");
+        std::os::unix::fs::symlink(&input, &alias).unwrap();
+        for mode in [Mode::Copy, Mode::HardLink, Mode::Symlink] {
+            for out in [&input, &alias, &input.join(".")] {
+                let err = check_not_same_folder(&input, out, mode).unwrap_err();
+                assert!(err.0.contains("is the input folder"), "{mode:?} {out:?}");
+            }
+        }
+        assert!(check_not_same_folder(&input, &input, Mode::Move).is_ok());
+        assert!(check_not_same_folder(&input, &input.join("new"), Mode::Copy).is_ok());
+        let other = d.path().join("other");
+        fs::create_dir(&other).unwrap();
+        assert!(check_not_same_folder(&input, &other, Mode::Copy).is_ok());
     }
 
     #[test]

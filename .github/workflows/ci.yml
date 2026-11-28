@@ -22,6 +22,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
 
+  # Static builds: the release ships musl binaries for Linux.
+  linux-musl:
+    name: test (x86_64-unknown-linux-musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      # blake3 compiles C/assembly through cc, which needs musl-gcc.
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo test --locked --target x86_64-unknown-linux-musl
+
   # Keep in sync with rust-version in Cargo.toml.
   msrv:
     name: test (Rust 1.85)

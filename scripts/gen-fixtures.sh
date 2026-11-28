@@ -56,8 +56,9 @@ PY
 cp "$work/a.webp" "$out/a.webp"
 ex "-DateTimeOriginal=2023:01:02 03:04:05" "$out/a.webp"
 
-# ORF: TIFF-like header with the Olympus "RO" magic that neither metadata
-# crate parses (decision Q7). Content is filler; only the extension matters.
+# ORF: the Olympus "RO" TIFF magic with an empty IFD0, so it has no date and
+# lands in unknown/. Real ORF/RW2 samples are committed separately (see
+# tests/fixtures/README.md); this script doesn't make them.
 python3 - "$out/a.orf" <<'PY'
 import sys
 open(sys.argv[1], "wb").write(b"IIRO\x08\x00\x00\x00" + bytes(248))

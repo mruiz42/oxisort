@@ -82,6 +82,10 @@ pub struct ScanResult {
     pub errors: Vec<(PathBuf, String)>,
     /// `name.xmp` files shared by several media files: left in place.
     pub shared_sidecars: Vec<PathBuf>,
+    /// `.oxisort-tmp-*` files from an interrupted run: never sorted, never
+    /// deleted (the user removes them), and they keep their folder alive
+    /// for `--rmdirs`.
+    pub leftovers: Vec<PathBuf>,
     pub counts: ScanCounts,
 }
 
@@ -198,6 +202,10 @@ pub fn scan(opts: &ScanOptions<'_>) -> ScanResult {
         }
         if !ft.is_file() {
             res.counts.special_files += 1;
+            continue;
+        }
+        if crate::fsops::is_temp_leftover(entry.file_name()) {
+            res.leftovers.push(path.to_path_buf());
             continue;
         }
         if is_junk(entry.file_name()) {

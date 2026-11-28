@@ -158,6 +158,11 @@ pub struct Config {
     pub max_depth: Option<usize>,
     pub duplicates: Duplicates,
     pub rmdirs: bool,
+    /// `--durable`: fsync every written file and its folder.
+    pub durable: bool,
+    /// Re-read and blake3-check before deleting any source (off with
+    /// `--no-verify`).
+    pub verify: bool,
     pub jobs: usize,
     pub io_jobs: usize,
     pub verbosity: Verbosity,
@@ -221,6 +226,10 @@ pub struct DeleteGuard {
     /// kept copy itself (`depends_on` is set): it doesn't exist at planning,
     /// and its mtime after a copy depends on the target's time resolution.
     pub of_mtime: Option<SystemTime>,
+    /// The content hash both files had at planning (always set for a
+    /// planned delete: duplicates are decided by full hash). Checked again
+    /// right before deleting, unless `--no-verify`.
+    pub hash: Option<blake3::Hash>,
 }
 
 /// Why a file was deliberately not processed.
