@@ -106,21 +106,25 @@ pub fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
     check(unsafe { libc::renamex_np(s.as_ptr(), d.as_ptr(), libc::RENAME_EXCL) })
 }
 
-/// Linux: `renameat2(RENAME_NOREPLACE)`. Written but not run this session
-/// (plan decision Q5).
+/// Linux: `renameat2(RENAME_NOREPLACE)`, made as a raw syscall because
+/// musl (the static release builds) has no `renameat2` wrapper. Kernels
+/// older than 3.15 return `ENOSYS`, which callers treat as "unsupported".
 #[cfg(target_os = "linux")]
 pub fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
     let (s, d) = (cstr(src)?, cstr(dst)?);
-    // SAFETY: both pointers are valid NUL-terminated strings for the call.
-    check(unsafe {
-        libc::renameat2(
+    // SAFETY: both pointers are valid NUL-terminated strings for the call;
+    // the argument list matches the kernel's renameat2 signature.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             s.as_ptr(),
             libc::AT_FDCWD,
             d.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
-    })
+    };
+    check(if ret == -1 { -1 } else { 0 })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
