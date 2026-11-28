@@ -22,6 +22,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
 
+  # Keep in sync with rust-version in Cargo.toml.
+  msrv:
+    name: test (Rust 1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
   lint:
     runs-on: ubuntu-latest
     steps:
