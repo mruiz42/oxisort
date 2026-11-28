@@ -139,6 +139,11 @@ pub struct Args {
     #[arg(long, requires = "move_files", conflicts_with_all = ["link", "symlink"])]
     pub rmdirs: bool,
 
+    /// Skip the blake3 re-read before deleting a source (cross-device
+    /// moves, --delete-duplicates); only sizes and mtimes are checked.
+    #[arg(long)]
+    pub no_verify: bool,
+
     /// fsync every file and its folder before moving on: survives a power
     /// cut, but is much slower (3-15x for photo-sized copies).
     #[arg(long)]
@@ -297,6 +302,7 @@ impl Args {
             },
             rmdirs: self.rmdirs,
             durable: self.durable,
+            verify: !self.no_verify,
             jobs,
             io_jobs: usize::from(self.io_jobs),
             verbosity,

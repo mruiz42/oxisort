@@ -155,16 +155,26 @@ Every other copy is handled by one of three mutually exclusive policies:
   run. On exFAT, macOS also writes an AppleDouble `._.oxisort-tmp-*` twin next
   to a temp file; it is ignored like any other `._` file.
 - A move to another volume copies to a temp name, `fsync`s it (F_FULLFSYNC on
-  macOS), checks the size, renames it into place, and only then deletes the
-  source.
+  macOS), checks the size, **re-reads the copy from the device and compares
+  its blake3 with the source's**, renames it into place, and only then deletes
+  the source. A mismatch keeps the source and fails that file (exit 1).
+- **Verification.** No source is deleted until its copy is proven identical
+  by blake3: cross-volume moves (above) and `--delete-duplicates` (both files
+  are re-hashed right before the delete and must match the hash planning
+  found). Same-volume moves are renames and need no check. Measured cost on
+  this Mac (APFS disk image as the target): a cross-volume move of 200 × 3 MB
+  files took 7.4 s instead of 5.9 s (+26%); `--delete-duplicates` of 100
+  pairs took 1.59 s instead of 1.47 s. `--no-verify` skips the re-read and
+  keeps only the size and modification-time checks; the summary then says
+  `verification: skipped (--no-verify)`.
 - Duplicates are size-checked, then blake3-hashed (equality is decided by the
   full hash). Filing a duplicate never removes it: it is moved or copied with
   the same no-clobber primitives as any other file. Right before deleting,
   `--delete-duplicates` re-checks that the kept copy is still a regular file
   with the planned size and modification time (only the size when this run
   wrote it), and that the source still has its planned size, modification
-  time and inode. Contents are not hashed again. It never deletes a file
-  that shares its inode with the kept copy (`(same file, kept)`).
+  time and inode, then re-hashes both (see Verification). It never deletes a
+  file that shares its inode with the kept copy (`(same file, kept)`).
 - Symlinks in the input are not followed. System folders (`.Trashes`,
   `.Spotlight-V100`, `@eaDir`, …) and app libraries (`*.photoslibrary`,
   `*.lrlibrary`, …) are never entered. The output folder (if inside the

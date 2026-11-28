@@ -139,3 +139,37 @@ fn rmdirs_keeps_a_folder_holding_a_leftover() {
     assert_eq!(fs::read(&left).unwrap(), b"partial");
     assert_eq!(env.out_tree(), ["2017/01/02/20170102-030405123.jpg"]);
 }
+
+/// Issue #2: deleting a duplicate re-hashes both files, and the summary
+/// says so; `--no-verify` says verification was skipped.
+#[test]
+fn delete_duplicates_reports_verification() {
+    for (extra, line) in [
+        (&[][..], "verification:     1 files checked (blake3)"),
+        (
+            &["--no-verify"][..],
+            "verification:     skipped (--no-verify)",
+        ),
+    ] {
+        let env = Env::new();
+        env.add("dto.jpg", "a/dto.jpg");
+        env.add("dto.jpg", "b/dto.jpg");
+        let mut args = vec!["-m", "--delete-duplicates"];
+        args.extend_from_slice(extra);
+        let o = env.run(&args);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert!(stderr(&o).contains(line), "{}", stderr(&o));
+        assert!(stderr(&o).contains("(deleted 1)"), "{}", stderr(&o));
+        assert!(env.in_tree().is_empty(), "{:?}", env.in_tree());
+    }
+}
+
+/// A plain copy run deletes nothing, so it has no verification line.
+#[test]
+fn copy_run_has_no_verification_line() {
+    let env = Env::new();
+    env.add("dto.jpg", "dto.jpg");
+    let o = env.run(&[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("verification:"), "{}", stderr(&o));
+}

@@ -189,7 +189,8 @@ fn destination_appearing_after_planning_is_never_overwritten() {
         &pools.io,
         &Stop::new(),
         &progress,
-    );
+    )
+    .outcomes;
     match &outcomes[0] {
         Outcome::Failed(msg) => assert!(msg.contains("destination appeared"), "{msg}"),
         other => panic!("expected failure, got {other:?}"),
@@ -236,7 +237,8 @@ fn failed_move_keeps_its_in_input_duplicate() {
         &pools.io,
         &Stop::new(),
         &progress,
-    );
+    )
+    .outcomes;
     assert!(matches!(outcomes[0], Outcome::Failed(_)), "{outcomes:?}");
     assert_eq!(
         outcomes[1],
@@ -832,7 +834,8 @@ fn failed_move_keeps_its_duplicate_out_of_the_dupdir() {
         &pools.io,
         &Stop::new(),
         &progress,
-    );
+    )
+    .outcomes;
     assert!(matches!(outcomes[0], Outcome::Failed(_)), "{outcomes:?}");
     assert_eq!(
         outcomes[1],
@@ -882,7 +885,8 @@ fn delete_keeps_source_when_kept_copy_is_rewritten_after_planning() {
         &pools.io,
         &Stop::new(),
         &progress,
-    );
+    )
+    .outcomes;
     assert!(
         matches!(&outcomes[0], Outcome::Failed(m) if m.contains("changed since planning")),
         "{outcomes:?}"

@@ -1,5 +1,6 @@
 //! Thin, safe wrappers over the OS primitives std doesn't expose:
-//! exclusive clone/rename and metadata-preserving copy.
+//! exclusive clone/rename, metadata-preserving copy, and page-cache control
+//! for verification reads.
 //!
 //! This file and `signal.rs` hold the crate's only `unsafe` code. Each
 //! wrapper converts its arguments to C strings, makes one FFI call and maps
@@ -125,6 +126,46 @@ pub fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
         )
     };
     check(if ret == -1 { -1 } else { 0 })
+}
+
+/// Turns off caching for data written through `file` from now on, so a
+/// later read of it comes from the device, not from memory. Measured on
+/// APFS: a 200 MB file written with `fcopyfile` into an `F_NOCACHE` fd
+/// re-reads at ~2 GB/s (device) instead of ~16 GB/s (cached). Setting it on
+/// the *reader* instead doesn't evict pages already cached.
+#[cfg(target_os = "macos")]
+pub fn set_nocache(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `file` is a valid open fd for the duration of the call, and
+    // F_NOCACHE takes a plain int argument.
+    check(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) })
+}
+
+/// Linux drops the pages after the write instead ([`drop_cache`]).
+#[cfg(target_os = "linux")]
+pub fn set_nocache(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
+/// Linux: asks the kernel to drop `file`'s cached pages, so the next read
+/// comes from the device. Dirty pages are never dropped, so callers fsync
+/// first.
+#[cfg(target_os = "linux")]
+pub fn drop_cache(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `file` is a valid open fd; offset 0 and length 0 mean "the
+    // whole file". posix_fadvise returns the error number instead of
+    // setting errno.
+    match unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) } {
+        0 => Ok(()),
+        err => Err(io::Error::from_raw_os_error(err)),
+    }
+}
+
+/// macOS writes with `F_NOCACHE` instead ([`set_nocache`]).
+#[cfg(target_os = "macos")]
+pub fn drop_cache(_file: &File) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]

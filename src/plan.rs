@@ -899,7 +899,7 @@ pub(crate) fn resolve(
                     path,
                     dev_ino,
                     mtime,
-                }) => duplicate(c, path, (dev_ino, mtime), None, policy),
+                }) => duplicate(c, path, (dev_ino, mtime), None, &key, policy),
                 Some(Keeper::InPlace { task: k, .. }) if k == task => {
                     Action::AlreadyInPlace { src: c.src }
                 }
@@ -908,12 +908,12 @@ pub(crate) fn resolve(
                     dev_ino,
                     mtime,
                     ..
-                }) => duplicate(c, src, (dev_ino, mtime), None, policy),
+                }) => duplicate(c, src, (dev_ino, mtime), None, &key, policy),
                 Some(Keeper::Planned {
                     task: k,
                     dst,
                     dev_ino,
-                }) => duplicate(c, dst, (dev_ino, None), Some(k), policy),
+                }) => duplicate(c, dst, (dev_ino, None), Some(k), &key, policy),
                 None => {
                     let dev_ino = c.dev_ino;
                     let action = r.place(c);
@@ -1056,6 +1056,7 @@ fn duplicate(
     of: PathBuf,
     (of_dev_ino, of_mtime): (DevIno, Option<SystemTime>),
     depends_on: Option<usize>,
+    key: &ContentKey,
     policy: DupPolicy,
 ) -> Action {
     let handling = match policy {
@@ -1066,6 +1067,12 @@ fn duplicate(
         DupPolicy::Delete => DupHandling::Delete(DeleteGuard {
             src_mtime: c.mtime,
             of_mtime,
+            // An inode-keyed match is the same inode (KeepSameFile above),
+            // so a delete always comes from a hashed key.
+            hash: match key {
+                ContentKey::Hash(_, h) => Some(*h),
+                ContentKey::Inode(_) => None,
+            },
         }),
     };
     Action::Duplicate {
@@ -1315,13 +1322,13 @@ mod tests {
         w.file(OUT, "x.jpg", 5, 99, Some(7));
         w.content(11, 7);
         let acts = w.resolve(vec![cand("/in/a.jpg", "x", 5, 11)], DupPolicy::Delete);
+        let guard = DeleteGuard {
+            hash: Some(blake3::hash(&[7])),
+            ..DeleteGuard::default()
+        };
         assert_eq!(
             dup(&acts[0]),
-            (
-                format!("{OUT}/x.jpg"),
-                None,
-                DupHandling::Delete(DeleteGuard::default())
-            )
+            (format!("{OUT}/x.jpg"), None, DupHandling::Delete(guard))
         );
     }
 
@@ -1573,13 +1580,13 @@ mod tests {
         w.file(OUT, "x-3.jpg", 5, 93, Some(3));
         w.content(11, 3);
         let acts = w.resolve(vec![cand("/in/a.jpg", "x", 5, 11)], DupPolicy::Delete);
+        let guard = DeleteGuard {
+            hash: Some(blake3::hash(&[3])),
+            ..DeleteGuard::default()
+        };
         assert_eq!(
             dup(&acts[0]),
-            (
-                format!("{OUT}/x-3.jpg"),
-                None,
-                DupHandling::Delete(DeleteGuard::default())
-            )
+            (format!("{OUT}/x-3.jpg"), None, DupHandling::Delete(guard))
         );
     }
 
@@ -2321,9 +2328,12 @@ mod tests {
                 // Step 4e (filing) is checked separately, in U17's test.
                 DupPolicy::File | DupPolicy::Skip => DupHandling::Report,
                 DupPolicy::Delete if o.ino == keeper.0 => DupHandling::KeepSameFile,
+                // A delete is always a content match: the full hash
+                // the fake reader gives class `cid`.
                 DupPolicy::Delete => DupHandling::Delete(DeleteGuard {
                     src_mtime: c.mtime,
                     of_mtime: keeper.1,
+                    hash: Some(blake3::hash(&[o.cid as u8, 0])),
                 }),
             }
         };

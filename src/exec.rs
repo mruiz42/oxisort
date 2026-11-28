@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use indicatif::ProgressBar;
@@ -235,12 +235,24 @@ struct Exec<'a> {
     bar: ProgressBar,
     bytes: AtomicU64,
     started: Instant,
+    /// Files whose contents were re-read and blake3-checked before their
+    /// source was deleted (cross-device moves, deleted duplicates).
+    verified: AtomicUsize,
     /// One warning per run for the exFAT check-then-rename fallback
     /// (moves, and copies placed from their temp file).
     warned_unchecked: AtomicBool,
 }
 
-/// Executes the plan for real. Returns one outcome per action, in order.
+/// What [`execute`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Executed {
+    /// One outcome per action, in plan order.
+    pub outcomes: Vec<Outcome>,
+    /// Files blake3-verified before a source was deleted.
+    pub verified: usize,
+}
+
+/// Executes the plan for real.
 pub fn execute(
     plan: &Plan,
     mode: Mode,
@@ -248,7 +260,7 @@ pub fn execute(
     io_pool: &rayon::ThreadPool,
     stop: &Stop,
     progress: &Progress,
-) -> Vec<Outcome> {
+) -> Executed {
     // Filed duplicates do real I/O too, so they count on the bar.
     let n_transfers = plan
         .actions
@@ -271,6 +283,7 @@ pub fn execute(
         bar: progress.bar(n_transfers as u64, "transferring"),
         bytes: AtomicU64::new(0),
         started: Instant::now(),
+        verified: AtomicUsize::new(0),
         warned_unchecked: AtomicBool::new(false),
     };
     let mut outcomes: Vec<Option<Outcome>> = vec![None; plan.actions.len()];
@@ -341,10 +354,13 @@ pub fn execute(
     }
     ex.bar.finish_and_clear();
 
-    outcomes
-        .into_iter()
-        .map(|o| o.expect("every action has an outcome"))
-        .collect()
+    Executed {
+        outcomes: outcomes
+            .into_iter()
+            .map(|o| o.expect("every action has an outcome"))
+            .collect(),
+        verified: ex.verified.into_inner(),
+    }
 }
 
 /// Creates every target folder; returns the error for each one that failed.
@@ -418,8 +434,12 @@ impl Exec<'_> {
         let r = match self.mode {
             Mode::Copy => fsops::copy_file(src, dst, opts)
                 .map(|how| self.warn_if_unchecked(how == CopyHow::CopiedUnchecked)),
-            Mode::Move => fsops::move_file(src, dst, opts)
-                .map(|how| self.warn_if_unchecked(how.is_unchecked())),
+            Mode::Move => fsops::move_file(src, dst, opts).map(|(how, hash)| {
+                self.warn_if_unchecked(how.is_unchecked());
+                if hash.is_some() {
+                    self.verified.fetch_add(1, Ordering::Relaxed);
+                }
+            }),
             Mode::HardLink => fsops::hard_link(src, dst, opts),
             Mode::Symlink => fsops::symlink(src, dst, opts),
         };
@@ -524,10 +544,14 @@ impl Exec<'_> {
                     dev_ino: *dev_ino,
                     guard: *guard,
                     of_written_by_run: depends_on.is_some(),
+                    verify: self.opts.verify,
                 };
                 if let Err(msg) = delete_verified(src, of, &planned) {
                     log::error!("{}: {msg}", src.display());
                     return Outcome::Failed(msg);
+                }
+                if planned.verify {
+                    self.verified.fetch_add(1, Ordering::Relaxed);
                 }
                 DupHow::Deleted
             }
@@ -554,14 +578,18 @@ struct Planned {
     guard: DeleteGuard,
     /// This run created the kept copy (wave 1): it had no mtime at planning.
     of_written_by_run: bool,
+    /// Re-read both files and compare them with the planned hash (off:
+    /// `--no-verify`).
+    verify: bool,
 }
 
 /// Deletes a duplicate source only after re-checking, right now, that the
 /// copy it duplicates is a regular file (not a symlink that might point back
 /// at the source) with the planned size, a different inode and, unless this
 /// run just wrote it, the planned mtime; and that the source itself still
-/// has its planned size, inode and mtime. Content is not re-read: the mtime
-/// is what catches a same-size rewrite in place.
+/// has its planned size, inode and mtime. Then, unless `--no-verify`, both
+/// files are re-read and must still hash to the content planning found
+/// (issue #2): that catches a same-size rewrite whose mtime was restored.
 fn delete_verified(src: &Path, of: &Path, p: &Planned) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     let of_meta = fs::symlink_metadata(of)
@@ -584,6 +612,23 @@ fn delete_verified(src: &Path, of: &Path, p: &Planned) -> Result<(), String> {
         || src_meta.modified().ok() != p.guard.src_mtime
     {
         return Err("source kept: it changed since planning".to_owned());
+    }
+    if p.verify {
+        let Some(want) = p.guard.hash else {
+            // Planning always hashes a deletable duplicate; never guess.
+            return Err("source kept: no planned hash to verify against".to_owned());
+        };
+        for (what, path) in [(of.display().to_string(), of), ("source".to_owned(), src)] {
+            match fsops::hash_with_buf(path) {
+                Ok(h) if h == want => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "source kept: contents of {what} differ from planning (blake3 mismatch)"
+                    ));
+                }
+                Err(e) => return Err(format!("source kept: cannot verify {what}: {e}")),
+            }
+        }
     }
     fs::remove_file(src).map_err(|e| format!("delete duplicate: {e}"))
 }
@@ -722,5 +767,143 @@ mod tests {
             "dup-copy /in/b.jpg -> /out/duplicates/b.jpg (duplicate of /out/a.jpg)\n  \
              ! /in/b.xmp -> /out/b.xmp (failed)"
         );
+    }
+
+    /// Issue #2 / DoD 5: the kept copy is rewritten after planning with the
+    /// same size and its mtime restored, so only the content differs. The
+    /// blake3 re-check keeps the source and fails the action (exit 1);
+    /// `--no-verify` falls back to the metadata checks and deletes.
+    #[test]
+    fn rewritten_kept_copy_with_restored_mtime_keeps_the_source() {
+        use std::os::unix::fs::MetadataExt;
+        for verify in [true, false] {
+            let d = tempfile::tempdir().unwrap();
+            let src = d.path().join("in.jpg");
+            let of = d.path().join("kept.jpg");
+            fs::write(&src, b"same bytes").unwrap();
+            fs::write(&of, b"same bytes").unwrap();
+            let mtime = |p: &Path| fs::metadata(p).unwrap().modified().unwrap();
+            let (src_mtime, of_mtime) = (mtime(&src), mtime(&of));
+            let m = fs::metadata(&src).unwrap();
+            let guard = DeleteGuard {
+                src_mtime: Some(src_mtime),
+                of_mtime: Some(of_mtime),
+                hash: Some(blake3::hash(b"same bytes")),
+            };
+            // After planning: same size, new bytes, old mtime.
+            fs::write(&of, b"SAME BYTES").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&of)
+                .unwrap()
+                .set_modified(of_mtime)
+                .unwrap();
+            let plan = Plan {
+                actions: vec![Action::Duplicate {
+                    src: src.clone(),
+                    of: of.clone(),
+                    handling: DupHandling::Delete(guard),
+                    depends_on: None,
+                    size: m.len(),
+                    dev_ino: (m.dev(), m.ino()),
+                    sidecars_left: vec![],
+                }],
+                ..Plan::default()
+            };
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            let opts = WriteOpts {
+                durable: false,
+                verify,
+            };
+            let done = execute(
+                &plan,
+                Mode::Move,
+                opts,
+                &pool,
+                &Stop::new(),
+                &Progress::disabled(),
+            );
+            let mut summary = crate::report::RunSummary::default();
+            summary.add(&plan.actions[0], &done.outcomes[0]);
+            if verify {
+                match &done.outcomes[0] {
+                    Outcome::Failed(msg) => assert!(msg.contains("blake3 mismatch"), "{msg}"),
+                    other => panic!("expected a failure, got {other:?}"),
+                }
+                assert_eq!(fs::read(&src).unwrap(), b"same bytes", "source kept");
+                assert_eq!(summary.exit_code(), 1);
+                assert_eq!(done.verified, 0);
+            } else {
+                assert!(
+                    matches!(
+                        done.outcomes[0],
+                        Outcome::Duplicate {
+                            how: DupHow::Deleted,
+                            ..
+                        }
+                    ),
+                    "{:?}",
+                    done.outcomes
+                );
+                assert!(!src.exists(), "old behaviour: deleted on metadata alone");
+            }
+        }
+    }
+
+    /// A clean duplicate is deleted after both files are re-hashed.
+    #[test]
+    fn verified_duplicate_is_deleted_and_counted() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("in.jpg");
+        let of = d.path().join("kept.jpg");
+        fs::write(&src, b"same bytes").unwrap();
+        fs::write(&of, b"same bytes").unwrap();
+        let mtime = |p: &Path| fs::metadata(p).unwrap().modified().ok();
+        let m = fs::metadata(&src).unwrap();
+        let plan = Plan {
+            actions: vec![Action::Duplicate {
+                src: src.clone(),
+                of: of.clone(),
+                handling: DupHandling::Delete(DeleteGuard {
+                    src_mtime: mtime(&src),
+                    of_mtime: mtime(&of),
+                    hash: Some(blake3::hash(b"same bytes")),
+                }),
+                depends_on: None,
+                size: m.len(),
+                dev_ino: (m.dev(), m.ino()),
+                sidecars_left: vec![],
+            }],
+            ..Plan::default()
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let done = execute(
+            &plan,
+            Mode::Move,
+            WriteOpts::default(),
+            &pool,
+            &Stop::new(),
+            &Progress::disabled(),
+        );
+        assert!(
+            matches!(
+                done.outcomes[0],
+                Outcome::Duplicate {
+                    how: DupHow::Deleted,
+                    ..
+                }
+            ),
+            "{:?}",
+            done.outcomes
+        );
+        assert_eq!(done.verified, 1);
+        assert!(!src.exists() && of.exists());
     }
 }

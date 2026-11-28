@@ -32,6 +32,10 @@ pub enum FsError {
     CrossDeviceLink,
     #[error("copy has {got} bytes, source has {want}; source kept")]
     SizeMismatch { got: u64, want: u64 },
+    #[error("copy verification failed (blake3 mismatch); source kept")]
+    VerifyFailed,
+    #[error("copy verification failed: {0}; source kept")]
+    Verify(io::Error),
     #[error("copied, but removing the source failed: {0}")]
     SourceNotRemoved(io::Error),
     #[error("{op}: {source}")]
@@ -67,13 +71,27 @@ pub fn is_temp_leftover(name: &OsStr) -> bool {
     name.as_bytes().starts_with(TEMP_PREFIX.as_bytes())
 }
 
-/// How hard a write tries to survive a crash or power loss.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// How hard a write tries to survive a crash or power loss, and to prove a
+/// copy before its source is deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteOpts {
     /// `--durable`: fsync every file oxisort writes (F_FULLFSYNC on macOS)
     /// before it gets its final name, and fsync the folder holding every
     /// name oxisort creates. Cross-device moves always do this.
     pub durable: bool,
+    /// Re-read a cross-device copy from the device and compare its blake3
+    /// with the source's before the source is deleted (off: `--no-verify`,
+    /// which keeps only the size check).
+    pub verify: bool,
+}
+
+impl Default for WriteOpts {
+    fn default() -> Self {
+        WriteOpts {
+            durable: false,
+            verify: true,
+        }
+    }
 }
 
 /// How a copy was carried out.
@@ -148,7 +166,7 @@ fn appeared_or<'a>(op: &'static str, dst: &'a Path) -> impl FnOnce(io::Error) ->
 /// # Errors
 /// [`FsError::DestinationAppeared`] if `dst` exists; [`FsError::Io`] otherwise.
 pub fn copy_file(src: &Path, dst: &Path, opts: &WriteOpts) -> Result<CopyHow, FsError> {
-    write_new(src, dst, opts, Kind::Copy, &Seam::default())
+    write_new(src, dst, opts, Kind::Copy, &Seam::default()).map(|(how, _)| how)
 }
 
 /// What `write_new` is writing for, which decides cloning and syncing.
@@ -157,21 +175,23 @@ enum Kind {
     /// A copy: may clone, syncs only under `durable`.
     Copy,
     /// The copy half of a cross-device move: never clones, always syncs
-    /// (the source is deleted afterwards), and checks the copy first.
+    /// (the source is deleted afterwards), and checks the copy (size, then
+    /// blake3 under `verify`) before it gets its final name.
     Move,
 }
 
 /// The one engine behind every data-writing operation: clone straight to
 /// `dst`, or copy into a temp file in `dst`'s folder and rename it into
 /// place with no-replace semantics. The final name is created only by the
-/// clone or the rename, never by a partial write.
+/// clone or the rename, never by a partial write. Returns the blake3 of the
+/// bytes when a move verified them.
 fn write_new(
     src: &Path,
     dst: &Path,
     opts: &WriteOpts,
     kind: Kind,
     seam: &Seam<'_>,
-) -> Result<CopyHow, FsError> {
+) -> Result<(CopyHow, Option<blake3::Hash>), FsError> {
     let src_file = File::open(src).map_err(FsError::io("open source"))?;
     let meta = src_file.metadata().map_err(FsError::io("stat source"))?;
     if kind == Kind::Copy {
@@ -181,7 +201,7 @@ fn write_new(
                     sync_path(dst)?;
                     sync_parent(dst);
                 }
-                return Ok(CopyHow::Cloned);
+                return Ok((CopyHow::Cloned, None));
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(FsError::DestinationAppeared(dst.to_path_buf()));
@@ -206,6 +226,11 @@ fn write_new(
         remove_partial(&temp);
         e
     };
+    let verify = kind == Kind::Move && opts.verify;
+    if verify {
+        // macOS: written uncached, so the verify re-read hits the device.
+        sys::set_nocache(&temp_file).map_err(|e| fail(FsError::io("set F_NOCACHE")(e)))?;
+    }
     sys::copy_contents(&src_file, &temp_file, &meta).map_err(|e| fail(FsError::io("copy")(e)))?;
     let sync = opts.durable || kind == Kind::Move;
     if sync {
@@ -213,11 +238,16 @@ fn write_new(
             .sync_all()
             .map_err(|e| fail(FsError::io("fsync")(e)))?;
     }
+    if verify {
+        // Linux: drop the (now clean) pages for the same reason.
+        sys::drop_cache(&temp_file).map_err(|e| fail(FsError::io("drop cache")(e)))?;
+    }
     // Delayed write errors (NFS, SMB) surface only at close.
     sys::close_checked(temp_file).map_err(|e| fail(FsError::io("close")(e)))?;
     if let Some(after_copy) = seam.after_copy {
         after_copy(&temp).map_err(|e| fail(FsError::io("copy")(e)))?;
     }
+    let mut verified = None;
     if kind == Kind::Move {
         let got = fs::metadata(&temp).map(|m| m.len()).unwrap_or(u64::MAX);
         if got != meta.len() {
@@ -226,16 +256,42 @@ fn write_new(
                 want: meta.len(),
             }));
         }
+        if verify {
+            verified = Some(verify_copy(&temp, src).map_err(fail)?);
+        }
     }
     let checked = place(&temp, dst, seam.force_unchecked).map_err(fail)?;
     if sync {
         sync_parent(dst);
     }
-    Ok(if checked {
+    let how = if checked {
         CopyHow::Copied
     } else {
         CopyHow::CopiedUnchecked
-    })
+    };
+    Ok((how, verified))
+}
+
+/// Issue #2: hashes the copy (from the device: it was written uncached or
+/// its pages were dropped) and the source (normally still cached from the
+/// copy a moment ago), and requires them to match. Returns the hash.
+fn verify_copy(copy: &Path, src: &Path) -> Result<blake3::Hash, FsError> {
+    let got = hash_with_buf(copy).map_err(FsError::Verify)?;
+    let want = hash_with_buf(src).map_err(FsError::Verify)?;
+    if got == want {
+        Ok(got)
+    } else {
+        Err(FsError::VerifyFailed)
+    }
+}
+
+/// [`crate::hash::hash_file`] with a per-thread buffer, so concurrent
+/// transfers don't each allocate 1 MiB per file.
+pub fn hash_with_buf(path: &Path) -> io::Result<blake3::Hash> {
+    thread_local! {
+        static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    BUF.with(|b| crate::hash::hash_file(path, &mut b.borrow_mut()))
 }
 
 /// Process-wide counter that makes temp names unique between threads.
@@ -315,14 +371,22 @@ fn remove_partial(path: &Path) {
 ///
 /// Same volume: atomic no-replace rename (check-then-rename where the
 /// filesystem lacks it). Different volume: copy to a temp name next to
-/// `dst`, `fsync` (F_FULLFSYNC on macOS), size check, rename into place,
-/// then delete the source.
+/// `dst`, `fsync` (F_FULLFSYNC on macOS), size check, blake3 check of the
+/// copy re-read from the device against the source (unless
+/// `opts.verify` is off), rename into place, then delete the source.
+///
+/// Returns how it moved and, for a verified cross-device copy, the hash.
 ///
 /// # Errors
-/// [`FsError::DestinationAppeared`] if `dst` exists; [`FsError::SizeMismatch`]
-/// (source kept) if the copy doesn't verify; [`FsError::SourceNotRemoved`]
-/// if the copy succeeded but the source couldn't be deleted.
-pub fn move_file(src: &Path, dst: &Path, opts: &WriteOpts) -> Result<MoveHow, FsError> {
+/// [`FsError::DestinationAppeared`] if `dst` exists; [`FsError::SizeMismatch`],
+/// [`FsError::VerifyFailed`] or [`FsError::Verify`] (source kept) if the
+/// copy doesn't verify; [`FsError::SourceNotRemoved`] if the copy succeeded
+/// but the source couldn't be deleted.
+pub fn move_file(
+    src: &Path,
+    dst: &Path,
+    opts: &WriteOpts,
+) -> Result<(MoveHow, Option<blake3::Hash>), FsError> {
     move_file_with(src, dst, opts, &Seam::default())
 }
 
@@ -332,7 +396,7 @@ pub(crate) fn move_file_with(
     dst: &Path,
     opts: &WriteOpts,
     seam: &Seam<'_>,
-) -> Result<MoveHow, FsError> {
+) -> Result<(MoveHow, Option<blake3::Hash>), FsError> {
     if !seam.force_cross_device {
         let how = match sys::rename_noreplace(src, dst) {
             Ok(()) => MoveHow::Renamed,
@@ -361,7 +425,7 @@ pub(crate) fn move_file_with(
         if opts.durable {
             sync_parent(dst);
         }
-        return Ok(how);
+        return Ok((how, None));
     }
     move_across_devices(src, dst, opts, seam)
 }
@@ -380,14 +444,15 @@ fn move_across_devices(
     dst: &Path,
     opts: &WriteOpts,
     seam: &Seam<'_>,
-) -> Result<MoveHow, FsError> {
-    let how = write_new(src, dst, opts, Kind::Move, seam)?;
+) -> Result<(MoveHow, Option<blake3::Hash>), FsError> {
+    let (how, verified) = write_new(src, dst, opts, Kind::Move, seam)?;
     fs::remove_file(src).map_err(FsError::SourceNotRemoved)?;
-    Ok(if how == CopyHow::CopiedUnchecked {
+    let how = if how == CopyHow::CopiedUnchecked {
         MoveHow::CopiedAcrossDevicesUnchecked
     } else {
         MoveHow::CopiedAcrossDevices
-    })
+    };
+    Ok((how, verified))
 }
 
 /// fsyncs an existing file by path (a clone, which we never opened).
@@ -465,15 +530,22 @@ mod tests {
         (d, src)
     }
 
-    const OPTS: WriteOpts = WriteOpts { durable: false };
+    const OPTS: WriteOpts = WriteOpts {
+        durable: false,
+        verify: true,
+    };
+    const NO_VERIFY: WriteOpts = WriteOpts {
+        durable: false,
+        verify: false,
+    };
 
     fn copy_seam(seam: &Seam<'_>, src: &Path, dst: &Path) -> Result<CopyHow, FsError> {
-        write_new(src, dst, &OPTS, Kind::Copy, seam)
+        write_new(src, dst, &OPTS, Kind::Copy, seam).map(|(how, _)| how)
     }
 
     /// The data-copy path (no clone), as on another volume or on Linux.
     fn data_copy(src: &Path, dst: &Path, seam: &Seam<'_>) -> Result<CopyHow, FsError> {
-        write_new(src, dst, &OPTS, Kind::Move, seam)
+        write_new(src, dst, &OPTS, Kind::Move, seam).map(|(how, _)| how)
     }
 
     /// Names in `dir` that are oxisort temp files.
@@ -614,7 +686,7 @@ mod tests {
             force_unchecked: true,
             ..Seam::default()
         };
-        let how = move_file_with(&src, &moved, &OPTS, &seam).unwrap();
+        let (how, _) = move_file_with(&src, &moved, &OPTS, &seam).unwrap();
         assert_eq!(how, MoveHow::CopiedAcrossDevicesUnchecked);
         assert!(how.is_unchecked());
     }
@@ -633,7 +705,10 @@ mod tests {
     #[test]
     fn durable_operations_succeed() {
         let (d, src) = setup();
-        let opts = WriteOpts { durable: true };
+        let opts = WriteOpts {
+            durable: true,
+            verify: true,
+        };
         let p = |n: &str| d.path().join(n);
         copy_file(&src, &p("c.bin"), &opts).unwrap();
         write_new(&src, &p("d.bin"), &opts, Kind::Move, &Seam::default()).unwrap();
@@ -662,7 +737,11 @@ mod tests {
         assert!(src.exists());
 
         let dst = d.path().join("dst.bin");
-        assert_eq!(move_file(&src, &dst, &OPTS).unwrap(), MoveHow::Renamed);
+        assert_eq!(
+            move_file(&src, &dst, &OPTS).unwrap(),
+            (MoveHow::Renamed, None),
+            "same-volume renames are not hashed"
+        );
         assert!(!src.exists());
         assert_eq!(fs::read(&dst).unwrap(), b"hello world");
     }
@@ -678,8 +757,9 @@ mod tests {
     fn cross_device_move_copies_then_deletes() {
         let (d, src) = setup();
         let dst = d.path().join("dst.bin");
-        let how = move_file_with(&src, &dst, &OPTS, &cross()).unwrap();
+        let (how, hash) = move_file_with(&src, &dst, &OPTS, &cross()).unwrap();
         assert_eq!(how, MoveHow::CopiedAcrossDevices);
+        assert_eq!(hash, Some(blake3::hash(b"hello world")));
         assert!(!src.exists());
         assert_eq!(fs::read(&dst).unwrap(), b"hello world");
         assert!(temps(d.path()).is_empty());
@@ -687,21 +767,57 @@ mod tests {
 
     #[test]
     fn cross_device_size_mismatch_keeps_source() {
+        for opts in [OPTS, NO_VERIFY] {
+            let (d, src) = setup();
+            let dst = d.path().join("dst.bin");
+            let truncate = |p: &Path| fs::write(p, b"short");
+            let seam = Seam {
+                after_copy: Some(&truncate),
+                ..cross()
+            };
+            let err = move_file_with(&src, &dst, &opts, &seam).unwrap_err();
+            assert!(
+                matches!(err, FsError::SizeMismatch { got: 5, want: 11 }),
+                "{err}"
+            );
+            assert_eq!(fs::read(&src).unwrap(), b"hello world");
+            assert!(!dst.exists(), "bad copy never gets the final name");
+            assert!(temps(d.path()).is_empty(), "bad copy is removed");
+        }
+    }
+
+    /// Issue #2: a same-size corruption of the copy is caught by the
+    /// blake3 re-read; the source is kept and nothing gets the final name.
+    #[test]
+    fn cross_device_corruption_is_caught_by_verification() {
         let (d, src) = setup();
         let dst = d.path().join("dst.bin");
-        let truncate = |p: &Path| fs::write(p, b"short");
+        let flip = |p: &Path| fs::write(p, b"hello_world");
         let seam = Seam {
-            after_copy: Some(&truncate),
+            after_copy: Some(&flip),
             ..cross()
         };
         let err = move_file_with(&src, &dst, &OPTS, &seam).unwrap_err();
-        assert!(
-            matches!(err, FsError::SizeMismatch { got: 5, want: 11 }),
-            "{err}"
-        );
+        assert!(matches!(err, FsError::VerifyFailed), "{err}");
+        assert!(err.to_string().contains("source kept"), "{err}");
         assert_eq!(fs::read(&src).unwrap(), b"hello world");
-        assert!(!dst.exists(), "bad copy never gets the final name");
-        assert!(temps(d.path()).is_empty(), "bad copy is removed");
+        assert!(!dst.exists());
+        assert!(temps(d.path()).is_empty());
+    }
+
+    /// `--no-verify`: the old behaviour, size check only.
+    #[test]
+    fn no_verify_skips_the_hash_check() {
+        let (d, src) = setup();
+        let dst = d.path().join("dst.bin");
+        let flip = |p: &Path| fs::write(p, b"hello_world");
+        let seam = Seam {
+            after_copy: Some(&flip),
+            ..cross()
+        };
+        let (how, hash) = move_file_with(&src, &dst, &NO_VERIFY, &seam).unwrap();
+        assert_eq!((how, hash), (MoveHow::CopiedAcrossDevices, None));
+        assert!(!src.exists());
     }
 
     #[test]

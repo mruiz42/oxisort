@@ -185,18 +185,21 @@ pub fn run(cfg: &Config, stop: &Stop, progress: &Progress) -> Result<RunSummary,
         })?;
     }
     let (scanned, plan) = plan_run(cfg, &pools, stop, progress);
-    let outcomes = if cfg.dry_run {
-        exec::simulate(&plan, cfg.mode)
+    let (outcomes, verified) = if cfg.dry_run {
+        (exec::simulate(&plan, cfg.mode), 0)
     } else if let Some(why) = stop.reason() {
-        exec::not_run(&plan, why)
+        (exec::not_run(&plan, why), 0)
     } else {
         let opts = fsops::WriteOpts {
             durable: cfg.durable,
+            verify: cfg.verify,
         };
-        exec::execute(&plan, cfg.mode, opts, &pools.io, stop, progress)
+        let done = exec::execute(&plan, cfg.mode, opts, &pools.io, stop, progress);
+        (done.outcomes, done.verified)
     };
 
     let mut summary = summarize(cfg, &scanned, &plan, &outcomes);
+    summary.verified = verified;
     let rm = exec::remove_dirs(&plan.rmdirs, cfg.dry_run, stop);
     summary.dirs_removed = rm.dirs;
     summary.junk_removed = rm.junk;
@@ -231,6 +234,7 @@ pub fn summarize(
         scan: scanned.counts.clone(),
         shared_sidecars: scanned.shared_sidecars.len(),
         leftovers: scanned.leftovers.len(),
+        verify_skipped: !cfg.verify,
         ..RunSummary::default()
     };
     summary.errors.extend(

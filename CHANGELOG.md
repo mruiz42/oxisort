@@ -25,6 +25,12 @@ All notable changes to oxisort are recorded here. The format follows
   as moves.
 
 ### Added
+- blake3 verification before any source is deleted: a cross-volume move
+  re-reads its copy from the device (uncached) and compares it with the
+  source before renaming it into place, and `--delete-duplicates` re-hashes
+  both files right before the delete. A mismatch keeps the source and exits
+  1. `--no-verify` restores the old size-and-mtime checks. The summary has a
+  `verification:` line.
 - `--durable` fsyncs every written file and its folder, so a power cut can't
   lose a file the run reported as done. Off by default (3-15x slower copies).
 - Capture dates are read from Olympus ORF and Panasonic RW2 raw files
