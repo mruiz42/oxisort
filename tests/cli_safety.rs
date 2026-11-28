@@ -93,3 +93,49 @@ fn refusal_happens_before_the_log_file_is_created() {
     assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
     assert!(!log.exists(), "nothing may be touched");
 }
+
+/// Issue #1: temp files from an interrupted run, in INPUT or OUTPUT, are
+/// listed in one warning, left untouched, and never sorted or filed.
+#[test]
+fn leftover_temp_files_are_reported_and_never_touched() {
+    let env = Env::new();
+    env.add("dto.jpg", "dto.jpg");
+    let in_left = env.write(".oxisort-tmp-2-0-0", b"partial input");
+    let out_dir = env.output.join("2017/01/02");
+    fs::create_dir_all(&out_dir).unwrap();
+    let out_left = out_dir.join(".oxisort-tmp-1-0-0");
+    fs::write(&out_left, b"partial output").unwrap();
+
+    let o = env.run(&[]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("2 leftover temp files from an interrupted run"),
+        "{err}"
+    );
+    assert!(err.contains(&in_left.display().to_string()), "{err}");
+    assert!(err.contains(&out_left.display().to_string()), "{err}");
+    assert!(err.contains("leftover temp files 2"), "{err}");
+    assert_eq!(fs::read(&in_left).unwrap(), b"partial input");
+    assert_eq!(fs::read(&out_left).unwrap(), b"partial output");
+    assert_eq!(
+        env.out_tree(),
+        [
+            "2017/01/02/.oxisort-tmp-1-0-0",
+            "2017/01/02/20170102-030405123.jpg"
+        ]
+    );
+}
+
+/// A source folder holding only a leftover is not "empty" for --rmdirs.
+#[test]
+fn rmdirs_keeps_a_folder_holding_a_leftover() {
+    let env = Env::new();
+    env.add("dto.jpg", "sub/dto.jpg");
+    let left = env.write("sub/.oxisort-tmp-3-0-0", b"partial");
+    env.write("sub/.DS_Store", b"junk");
+    let o = env.run(&["-m", "--rmdirs"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(fs::read(&left).unwrap(), b"partial");
+    assert_eq!(env.out_tree(), ["2017/01/02/20170102-030405123.jpg"]);
+}

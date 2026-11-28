@@ -128,13 +128,34 @@ pub fn plan_run(
     }
 
     let spinner = progress.spinner("planning");
-    let plan = plan::build(extracted, &scanned.dirs, cfg, pools, stop);
+    let mut plan = plan::build(extracted, &scanned.dirs, cfg, pools, stop);
     spinner.finish_and_clear();
+    // Reported before any stop check, so even an interrupted run says so.
+    scanned.leftovers.append(&mut plan.out_leftovers);
+    warn_leftovers(&scanned.leftovers);
     // A stop during hashing leaves an incomplete hash map; discard the plan.
     if stopped_before(stop, "executing") {
         return (scanned, Plan::default());
     }
     (scanned, plan)
+}
+
+/// One warning listing every temp file an interrupted run left behind
+/// (issue #1). They are never deleted automatically: a leftover is a
+/// partial copy whose source still exists, but only the user can be sure.
+fn warn_leftovers(leftovers: &[PathBuf]) {
+    if leftovers.is_empty() {
+        return;
+    }
+    let list: Vec<String> = leftovers
+        .iter()
+        .map(|p| format!("  {}", p.display()))
+        .collect();
+    log::warn!(
+        "{} leftover temp files from an interrupted run (not touched; delete them by hand):\n{}",
+        leftovers.len(),
+        list.join("\n")
+    );
 }
 
 /// True (and logged) if the run should stop before `phase`.
@@ -169,7 +190,10 @@ pub fn run(cfg: &Config, stop: &Stop, progress: &Progress) -> Result<RunSummary,
     } else if let Some(why) = stop.reason() {
         exec::not_run(&plan, why)
     } else {
-        exec::execute(&plan, cfg.mode, &pools.io, stop, progress)
+        let opts = fsops::WriteOpts {
+            durable: cfg.durable,
+        };
+        exec::execute(&plan, cfg.mode, opts, &pools.io, stop, progress)
     };
 
     let mut summary = summarize(cfg, &scanned, &plan, &outcomes);
@@ -206,6 +230,7 @@ pub fn summarize(
             .into_owned(),
         scan: scanned.counts.clone(),
         shared_sidecars: scanned.shared_sidecars.len(),
+        leftovers: scanned.leftovers.len(),
         ..RunSummary::default()
     };
     summary.errors.extend(

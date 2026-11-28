@@ -136,14 +136,27 @@ Every other copy is handled by one of three mutually exclusive policies:
 
 ## Safety
 
-- Every destination write is exclusive: APFS clone or `O_EXCL` create for
-  copies, `renamex_np(RENAME_EXCL)` (macOS) / `renameat2(RENAME_NOREPLACE)`
-  (Linux) for moves. A file that appears at a planned name after planning is
-  reported, never overwritten.
-- **exFAT** (and other volumes without an atomic no-replace rename): moves use
-  check-then-rename, with one warning per run. Copies stay fully atomic.
-- A move to another volume copies, `fsync`s (F_FULLFSYNC on macOS), checks
-  the size, and only then deletes the source.
+- Every destination write is exclusive: an APFS clone, or a no-replace
+  rename (`renamex_np(RENAME_EXCL)` on macOS, `renameat2(RENAME_NOREPLACE)` on
+  Linux). A file that appears at a planned name after planning is reported,
+  never overwritten.
+- **Crash-safe copies.** A data copy (no clone possible) is written to a
+  hidden `.oxisort-tmp-*` file in the target folder and renamed to its final
+  name only once complete. A crash or `kill -9` never leaves a partial file
+  under a real name. Leftover temp files are skipped by later runs and listed
+  in one warning with their paths; oxisort never deletes them, so remove them
+  by hand.
+- `--durable` also fsyncs every file (F_FULLFSYNC on macOS) before it gets
+  its name, and the folder holding it, so a power cut can't lose a file the
+  run reported as done. It is off by default because it is slow: 3-15x for
+  photo-sized copies on an internal SSD.
+- **exFAT** (and other volumes without an atomic no-replace rename): moves and
+  copies claim their final name with check-then-rename, with one warning per
+  run. On exFAT, macOS also writes an AppleDouble `._.oxisort-tmp-*` twin next
+  to a temp file; it is ignored like any other `._` file.
+- A move to another volume copies to a temp name, `fsync`s it (F_FULLFSYNC on
+  macOS), checks the size, renames it into place, and only then deletes the
+  source.
 - Duplicates are size-checked, then blake3-hashed (equality is decided by the
   full hash). Filing a duplicate never removes it: it is moved or copied with
   the same no-clobber primitives as any other file. Right before deleting,

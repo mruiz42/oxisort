@@ -201,7 +201,14 @@ fn interrupt_before_transfers_runs_nothing() {
     let (cfg, pools, scanned, plan) = planned(&env);
     let stop = Stop::new();
     stop.request(NotRun::Interrupted);
-    let outcomes = exec::execute(&plan, cfg.mode, &pools.io, &stop, &Progress::disabled());
+    let outcomes = exec::execute(
+        &plan,
+        cfg.mode,
+        Default::default(),
+        &pools.io,
+        &stop,
+        &Progress::disabled(),
+    );
     assert!(
         outcomes
             .iter()
@@ -222,7 +229,14 @@ fn disk_full_stop_reports_not_run_and_exit_1() {
     let (cfg, pools, scanned, plan) = planned(&env);
     let stop = Stop::new();
     stop.request(NotRun::DiskFull);
-    let outcomes = exec::execute(&plan, cfg.mode, &pools.io, &stop, &Progress::disabled());
+    let outcomes = exec::execute(
+        &plan,
+        cfg.mode,
+        Default::default(),
+        &pools.io,
+        &stop,
+        &Progress::disabled(),
+    );
     assert_eq!(outcomes, [Outcome::NotRun(NotRun::DiskFull)]);
     let summary = oxisort::summarize(&cfg, &scanned, &plan, &outcomes);
     assert_eq!(summary.exit_code(), 1);
@@ -253,7 +267,14 @@ fn interrupt_reports_pending_duplicates_as_interrupted() {
     );
     let stop = Stop::new();
     stop.request(NotRun::Interrupted);
-    let outcomes = exec::execute(&plan, cfg.mode, &pools.io, &stop, &Progress::disabled());
+    let outcomes = exec::execute(
+        &plan,
+        cfg.mode,
+        Default::default(),
+        &pools.io,
+        &stop,
+        &Progress::disabled(),
+    );
     assert_eq!(
         outcomes,
         [
@@ -282,6 +303,7 @@ fn disk_full_header_end_to_end() {
     let outcomes = exec::execute(
         &plan,
         cfg.mode,
+        Default::default(),
         &pools.io,
         &Stop::new(),
         &Progress::disabled(),

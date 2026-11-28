@@ -182,7 +182,14 @@ fn destination_appearing_after_planning_is_never_overwritten() {
     fs::create_dir_all(dst.parent().unwrap()).unwrap();
     fs::write(&dst, b"someone else's file").unwrap();
 
-    let outcomes = exec::execute(&plan, cfg.mode, &pools.io, &Stop::new(), &progress);
+    let outcomes = exec::execute(
+        &plan,
+        cfg.mode,
+        Default::default(),
+        &pools.io,
+        &Stop::new(),
+        &progress,
+    );
     match &outcomes[0] {
         Outcome::Failed(msg) => assert!(msg.contains("destination appeared"), "{msg}"),
         other => panic!("expected failure, got {other:?}"),
@@ -222,7 +229,14 @@ fn failed_move_keeps_its_in_input_duplicate() {
     fs::create_dir_all(dst.parent().unwrap()).unwrap();
     fs::write(&dst, b"someone else's file").unwrap();
 
-    let outcomes = exec::execute(&plan, cfg.mode, &pools.io, &Stop::new(), &progress);
+    let outcomes = exec::execute(
+        &plan,
+        cfg.mode,
+        Default::default(),
+        &pools.io,
+        &Stop::new(),
+        &progress,
+    );
     assert!(matches!(outcomes[0], Outcome::Failed(_)), "{outcomes:?}");
     assert_eq!(
         outcomes[1],
@@ -811,7 +825,14 @@ fn failed_move_keeps_its_duplicate_out_of_the_dupdir() {
     let dst = env.output.join(DST);
     fs::create_dir_all(dst.parent().unwrap()).unwrap();
     fs::write(&dst, b"someone else's file").unwrap();
-    let outcomes = exec::execute(&plan, cfg.mode, &pools.io, &Stop::new(), &progress);
+    let outcomes = exec::execute(
+        &plan,
+        cfg.mode,
+        Default::default(),
+        &pools.io,
+        &Stop::new(),
+        &progress,
+    );
     assert!(matches!(outcomes[0], Outcome::Failed(_)), "{outcomes:?}");
     assert_eq!(
         outcomes[1],
@@ -854,7 +875,14 @@ fn delete_keeps_source_when_kept_copy_is_rewritten_after_planning() {
         .set_modified(later)
         .unwrap();
 
-    let outcomes = exec::execute(&plan, cfg.mode, &pools.io, &Stop::new(), &progress);
+    let outcomes = exec::execute(
+        &plan,
+        cfg.mode,
+        Default::default(),
+        &pools.io,
+        &Stop::new(),
+        &progress,
+    );
     assert!(
         matches!(&outcomes[0], Outcome::Failed(m) if m.contains("changed since planning")),
         "{outcomes:?}"

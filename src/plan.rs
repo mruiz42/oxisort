@@ -39,6 +39,8 @@ pub struct Plan {
     pub actions: Vec<Action>,
     /// Source folders `--rmdirs` will remove, deepest first.
     pub rmdirs: Vec<RmDir>,
+    /// Temp files from an interrupted run found by the OUT walk.
+    pub out_leftovers: Vec<PathBuf>,
 }
 
 /// A source folder expected to be empty (apart from junk) after the run.
@@ -325,7 +327,11 @@ pub fn build(
     } else {
         Vec::new()
     };
-    Plan { actions, rmdirs }
+    Plan {
+        actions,
+        rmdirs,
+        out_leftovers: out.leftovers().to_vec(),
+    }
 }
 
 /// True if `dir` would put a main-tree file inside the duplicates folder

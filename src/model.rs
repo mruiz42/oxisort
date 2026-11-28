@@ -158,6 +158,8 @@ pub struct Config {
     pub max_depth: Option<usize>,
     pub duplicates: Duplicates,
     pub rmdirs: bool,
+    /// `--durable`: fsync every written file and its folder.
+    pub durable: bool,
     pub jobs: usize,
     pub io_jobs: usize,
     pub verbosity: Verbosity,

@@ -139,6 +139,11 @@ pub struct Args {
     #[arg(long, requires = "move_files", conflicts_with_all = ["link", "symlink"])]
     pub rmdirs: bool,
 
+    /// fsync every file and its folder before moving on: survives a power
+    /// cut, but is much slower (3-15x for photo-sized copies).
+    #[arg(long)]
+    pub durable: bool,
+
     /// Threads for metadata reading [default: number of CPUs].
     #[arg(short = 'j', long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=512))]
     pub jobs: Option<u16>,
@@ -291,6 +296,7 @@ impl Args {
                 dir: dup_dir,
             },
             rmdirs: self.rmdirs,
+            durable: self.durable,
             jobs,
             io_jobs: usize::from(self.io_jobs),
             verbosity,

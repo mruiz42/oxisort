@@ -34,6 +34,8 @@ pub struct RunSummary {
     pub skipped_unknown: usize,
     pub scan: ScanCounts,
     pub shared_sidecars: usize,
+    /// `.oxisort-tmp-*` files from an interrupted run (input and output).
+    pub leftovers: usize,
     pub dirs_removed: usize,
     pub junk_removed: usize,
     /// `path: message` for every failure (files, sidecars, scan errors).
@@ -180,7 +182,7 @@ impl RunSummary {
         let _ = writeln!(
             s,
             "  skipped:          type {}, date range {}, unknown {}, ignored {}, symlinks {}, \
-             system folders {}, orphan sidecars {}, shared sidecars {}",
+             system folders {}, orphan sidecars {}, shared sidecars {}, leftover temp files {}",
             self.skipped_type,
             self.skipped_range,
             self.skipped_unknown,
@@ -188,7 +190,8 @@ impl RunSummary {
             c.symlinks,
             c.skipped_dirs,
             c.orphan_sidecars,
-            self.shared_sidecars
+            self.shared_sidecars,
+            self.leftovers
         );
         if self.dirs_removed > 0 || self.junk_removed > 0 {
             let _ = writeln!(

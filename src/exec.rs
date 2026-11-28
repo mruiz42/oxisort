@@ -18,7 +18,7 @@ use std::time::Instant;
 use indicatif::ProgressBar;
 use rayon::prelude::*;
 
-use crate::fsops::{self, FsError, MoveHow};
+use crate::fsops::{self, CopyHow, FsError, WriteOpts};
 use crate::logging::{ACTION, Progress};
 use crate::model::{
     Action, DeleteGuard, DupHandling, DupHow, Mode, NotRun, Outcome, PlannedSidecar, SidecarError,
@@ -230,11 +230,13 @@ fn stop_label(why: NotRun) -> &'static str {
 /// Shared state for one execution.
 struct Exec<'a> {
     mode: Mode,
+    opts: WriteOpts,
     stop: &'a Stop,
     bar: ProgressBar,
     bytes: AtomicU64,
     started: Instant,
-    /// One warning per run for the exFAT check-then-rename fallback.
+    /// One warning per run for the exFAT check-then-rename fallback
+    /// (moves, and copies placed from their temp file).
     warned_unchecked: AtomicBool,
 }
 
@@ -242,6 +244,7 @@ struct Exec<'a> {
 pub fn execute(
     plan: &Plan,
     mode: Mode,
+    opts: WriteOpts,
     io_pool: &rayon::ThreadPool,
     stop: &Stop,
     progress: &Progress,
@@ -263,6 +266,7 @@ pub fn execute(
         .count();
     let ex = Exec {
         mode,
+        opts,
         stop,
         bar: progress.bar(n_transfers as u64, "transferring"),
         bytes: AtomicU64::new(0),
@@ -410,19 +414,14 @@ impl Exec<'_> {
 
     /// One file operation in the run's mode. A full disk stops the run.
     fn one(&self, src: &Path, dst: &Path) -> Result<(), FsError> {
+        let opts = &self.opts;
         let r = match self.mode {
-            Mode::Copy => fsops::copy_file(src, dst).map(drop),
-            Mode::Move => fsops::move_file(src, dst).map(|how| {
-                if how == MoveHow::RenamedUnchecked
-                    && !self.warned_unchecked.swap(true, Ordering::SeqCst)
-                {
-                    log::warn!(
-                        "destination volume lacks atomic no-clobber rename; using check-then-rename"
-                    );
-                }
-            }),
-            Mode::HardLink => fsops::hard_link(src, dst),
-            Mode::Symlink => fsops::symlink(src, dst),
+            Mode::Copy => fsops::copy_file(src, dst, opts)
+                .map(|how| self.warn_if_unchecked(how == CopyHow::CopiedUnchecked)),
+            Mode::Move => fsops::move_file(src, dst, opts)
+                .map(|how| self.warn_if_unchecked(how.is_unchecked())),
+            Mode::HardLink => fsops::hard_link(src, dst, opts),
+            Mode::Symlink => fsops::symlink(src, dst, opts),
         };
         if let Err(e) = &r {
             if e.is_disk_full() {
@@ -430,6 +429,16 @@ impl Exec<'_> {
             }
         }
         r
+    }
+
+    /// Warns once per run that a final name was claimed with
+    /// check-then-rename, which isn't atomic against other processes.
+    fn warn_if_unchecked(&self, unchecked: bool) {
+        if unchecked && !self.warned_unchecked.swap(true, Ordering::SeqCst) {
+            log::warn!(
+                "destination volume lacks atomic no-clobber rename; using check-then-rename"
+            );
+        }
     }
 
     fn tick(&self, size: u64) {

@@ -21,6 +21,7 @@ use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::exec::Stop;
+use crate::fsops::is_temp_leftover;
 use crate::hash::{self, DevIno, Rep};
 use crate::scan::{is_junk, is_skipped_dir};
 
@@ -44,6 +45,8 @@ pub struct OutFile {
 pub struct OutIndex {
     files: Vec<OutFile>,
     links: Vec<(PathBuf, DevIno)>,
+    /// `.oxisort-tmp-*` files from an interrupted run: never keepers.
+    leftovers: Vec<PathBuf>,
 }
 
 /// What the OUT walk leaves out.
@@ -70,6 +73,7 @@ impl OutIndex {
             return OutIndex::default();
         }
         let mut found: Vec<(PathBuf, bool)> = Vec::new();
+        let mut leftovers = Vec::new();
         let mut it = WalkDir::new(root)
             .follow_links(false)
             .sort_by_file_name()
@@ -102,6 +106,10 @@ impl OutIndex {
             if is_junk(entry.file_name()) || skip.file == Some(entry.path()) {
                 continue;
             }
+            if ft.is_file() && is_temp_leftover(entry.file_name()) {
+                leftovers.push(entry.into_path());
+                continue;
+            }
             if ft.is_file() || ft.is_symlink() {
                 found.push((entry.into_path(), ft.is_symlink()));
             }
@@ -112,7 +120,10 @@ impl OutIndex {
                 .filter_map(|(path, link)| stat_out(path, link))
                 .collect()
         });
-        let mut index = OutIndex::default();
+        let mut index = OutIndex {
+            leftovers,
+            ..OutIndex::default()
+        };
         for s in stated {
             match s {
                 Stated::File(f) => index.files.push(f),
@@ -135,6 +146,11 @@ impl OutIndex {
     /// Adds a symlink resolving to `target` (tests and the walk).
     pub fn insert_link(&mut self, path: impl Into<PathBuf>, target: DevIno) {
         self.links.push((path.into(), target));
+    }
+
+    /// Temp files left in OUT by an interrupted run.
+    pub fn leftovers(&self) -> &[PathBuf] {
+        &self.leftovers
     }
 
     pub fn files(&self) -> &[OutFile] {
